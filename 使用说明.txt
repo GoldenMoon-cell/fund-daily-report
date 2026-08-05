@@ -2,15 +2,15 @@
 
 【这是什么】
 - ocr_hold.exe：把基金持仓截图识别成持仓数据
-- fund-daily-report.exe：主程序，生成/查看基金日报
+- fund-daily-report.exe：主程序，手动填入持仓数据，生成/查看基金日报
 所有识别都在你自己电脑完成，截图和持仓不上传。
 
 【配置要求】【推荐】
 - Windows 10/11，Python可选装
 - 内存建议 16GB 以上；显存建议8GB以上，纯 CPU 也能跑（慢）
-- 硬盘留 5G（识别模型用）
+- 硬盘留 5G（识别模型用）（可选）
 
-【第一次：装识别模型，只需一次】
+【第一次：装识别模型，只需一次】【可选】
 1. 去 ollama.com 下载 Windows 版，安装
 2. 按 Win+R，输入 cmd 回车，执行：
    ollama pull qwen2.5vl:7b
