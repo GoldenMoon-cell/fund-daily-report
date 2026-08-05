@@ -19,8 +19,8 @@ Windows 桌面基金看板：实时行情、持仓盈亏、红黑榜、涨跌柱
     pip install -r requirements.txt
     python app.py
 
-打包版（Windows）：到 Releases 下载 exe 双击运行。
-首次运行会在 exe 同目录自动创建 自定义基金.json（看板名单），在首页「➕ 快速添加」加入第一只基金。
+到 Releases 下载 zip ，解压到同一文件夹，双击 exe 运行，详见 使用说明.txt。
+首次运行，在首页「➕ 快速添加」加入第一只基金，会在 exe 同目录自动创建 自定义基金.json（看板名单）。
 
 ## 本地文件说明（均不入库）
 
@@ -41,8 +41,3 @@ Windows 桌面基金看板：实时行情、持仓盈亏、红黑榜、涨跌柱
 本工具仅供个人记账参考，不构成任何投资建议；行情数据或有延迟，以官方渠道为准。
 ---
 
-## 维护备忘（自用）
-
-- 打包 exe：pyinstaller app.spec，产物在 dist\ 里，拷到根目录覆盖旧版即可（配置/快照在用户目录，覆盖不丢数据）。
-
-- 同步代码：git add -A → git commit -m "说明" → git push。
