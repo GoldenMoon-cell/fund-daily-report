@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """基金日报助手 - 桌面版
 本地化的基金持仓看板与日报工具：实时估值/历史净值/回撤修复/同类排名/指数对比，
-持仓本地存储，支持粘贴导入、交易记账、已清仓标记与 OCR 快照对照。"""
+持仓本地存储，支持粘贴导入、交易记账、已清仓标记。
+（OCR 截图导入功能已移除，以加快迭代；如需可后续单独接回。）"""
 import sys
 import json
 import urllib.request
@@ -12,24 +13,28 @@ import numpy as np
 import os
 import shutil
 import tempfile
-# 工作目录固定为程序所在目录，保证相对路径在源码/脚本/打包环境下行为一致
-if getattr(sys, 'frozen', False):
-    _BASE = os.path.dirname(sys.executable)
-else:
-    _BASE = os.path.dirname(os.path.abspath(__file__))
-os.chdir(_BASE)
 from datetime import datetime, timedelta
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QScrollArea, QSizePolicy, QMessageBox,
     QTextEdit, QDialog, QStackedWidget, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QButtonGroup, QGraphicsOpacityEffect, QComboBox, QLineEdit, QFileDialog, QSplitter
+    QHeaderView, QAbstractItemView, QButtonGroup, QGraphicsOpacityEffect,
+    QComboBox, QLineEdit, QFileDialog, QSplitter, QCheckBox,
+    QRadioButton, QFormLayout, QDateEdit, QGridLayout,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPropertyAnimation, QAbstractAnimation
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtCore import (
+    Qt, QThread, Signal, QTimer, QPropertyAnimation, QAbstractAnimation, QDate,
+)
+from PySide6.QtGui import QFont, QColor, QCursor
 import pyqtgraph as pg
-from snapshot_view import SnapshotDialog, load_latest_snapshot as _load_snap
+
+# 工作目录固定为程序所在目录，保证相对路径在源码/脚本/打包环境下行为一致
+if getattr(sys, 'frozen', False):
+    _BASE = os.path.dirname(sys.executable)
+else:
+    _BASE = os.path.dirname(os.path.abspath(__file__))
+os.chdir(_BASE)
 
 FUNDS = []   # 看板基金全部来自「自定义基金.json」；初始为空看板，用户经首页『快速添加』自行建立名单
 EXTRA_FILE = "自定义基金.json"
@@ -47,24 +52,30 @@ def _load_extra():
         return out
     except Exception:
         return []
+
 def _save_extra(arr):
     try:
         with open(EXTRA_FILE, "w", encoding="utf-8") as f:
             json.dump(arr, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
 for _it in _load_extra():
     if _it["code"] not in {c for c, _ in FUNDS}:
         FUNDS.append((_it["code"], _it["name"]))
 NAME_MAP = {c: n for c, n in FUNDS}
+
 HOLD_FILE = "我的持仓.json"
 SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席=默认，不碰持仓账本
+APP_VERSION = "0.2.0"
+GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
 HL = QColor("#fff7d6")
 IMP = QColor("#ffe0b2")
 REPAIR_THRESHOLD = 0.5
 CMP_INDEX = [("1.000300", "沪深300"), ("1.000905", "中证500"), ("1.000016", "上证50"), ("0.399006", "创业板指")]
+
 # 基金类型样例库：仅用于详情页展示基金类型/跟踪指数说明，可自行增删
 TRACK = {
     "000001": ("主动混合型", "国内老牌主动混合基金样例（方向以季报为准）"),
@@ -75,6 +86,7 @@ TRACK = {
     "019548": ("股票指数型(QDII)", "跟踪 纳斯达克100指数（美股科技龙头）"),
     "013309": ("股票指数型(QDII)", "跟踪 恒生科技指数（港股科技龙头）"),
     "161120": ("债券指数型", "跟踪 中债-新综合指数（利率债+信用债综合）"),
+    "022098": ("股票指数型", "跟踪 中证红利低波动100指数（高股息+低波动双因子）"),
 }
 
 _SSL = ssl.create_default_context(); _SSL.check_hostname = False; _SSL.verify_mode = ssl.CERT_NONE
@@ -156,11 +168,6 @@ def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
        约定：调用方必须先 d=load_holdings() 读全，改完 save_holdings(d) 写全，
        不可拿单只 dict 去 save_holdings，否则覆盖其余基金。
        action ∈ {buy, sell, dividend_reinvest, dividend_cash, convert}。
-       buy: 需 nav, amount            → 加仓，补 shares/principal；若原无 buy_date 且给了 date 则补首笔
-       sell: 需 nav, shares           → 赎回，减 shares/principal(按成本)，已实现盈亏进 realized_out
-       dividend_reinvest: 需 nav, amount → 红利再投，加 shares，principal 不动
-       dividend_cash: 需 amount        → 现金分红，份额/成本/本金全不动，金额进 cashflow_out
-       convert: 暂按 sell 处理(转出方)，转入方另记一笔 buy
     """
     h = holdings.setdefault(code, {"shares": 0.0, "cost": 0.0, "principal": 0.0})
     sh = float(h.get("shares", 0) or 0)
@@ -184,7 +191,6 @@ def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
         new_sh = sh - sell_sh
         new_prin = prin - cost_out
         h["shares"], h["principal"] = new_sh, max(new_prin, 0.0)
-        # cost 不变(移动加权平均)；份额归零时成本清零避免脏值
         if new_sh <= 1e-9:
             h["shares"], h["cost"], h["principal"] = 0.0, 0.0, 0.0
         if realized_out is not None: realized_out[0] = realized
@@ -195,7 +201,6 @@ def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
         pass                                      # 三值全不动
         if cashflow_out is not None: cashflow_out[0] = float(amount)
     elif action == "convert":
-        # 转出方按 sell 记；调用方对转入方再调一次 buy
         sell_sh = float(shares)
         cost_out = cost * sell_sh
         realized = sell_sh * (float(nav) - cost)
@@ -206,6 +211,22 @@ def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
         if realized_out is not None: realized_out[0] = realized
     else:
         raise ValueError(f"未知 action: {action}")
+
+    # —— 同步流水到 trades.json（收益日历时间线的唯一账本）——
+    _rec = None
+    if action in ("buy", "dividend_reinvest"):
+        _rec = {"side": "buy", "amount": round(float(amount), 2)}
+    elif action in ("sell", "convert"):
+        _rec = {"side": "sell", "amount": round(float(shares) * float(nav), 2)}
+    if _rec is not None:
+        _rec["date"] = (date or datetime.now().strftime("%Y-%m-%d"))
+        _rec["code"] = code
+        _all = load_trades()
+        if not any(t.get("code") == code and t.get("side") == "open" for t in _all):
+            _all.append({"date": (h.get("buy_date") or _rec["date"]), "code": code,
+                         "side": "open", "shares": round(sh, 4)})
+        _all.append(_rec)
+        save_trades(_all)
     return h
 
 
@@ -259,7 +280,7 @@ def fetch_one(code):
         m = re.search(r"jsonpgz\((\{.*?\})\)", txt)
         if m:
             d = json.loads(m.group(1)); nav = float(d.get("dwjz", 0)); chg = float(d.get("gszzl", 0) or 0)
-            jzrq = (d.get("jzrq") or "").strip()          # 净值日期(接口自带)
+            jzrq = (d.get("jzrq") or "").strip()
             if nav > 0:
                 return {"code": code, "name": d.get("name", ""), "nav": nav,
                         "est": float(d.get("gsz", 0) or 0), "chg": chg, "nav_date": jzrq,
@@ -305,6 +326,7 @@ def fetch_history(code):
         if eqt is None and prev is not None and prev > 0:
             eqt = round((nav - prev) / prev * 100, 4)
         prev = nav; hist.append((ts, nav, eqt if eqt is not None else 0.0))
+
     # —— 同类排名解析 ——
     rank_by_ts = {}
     _m_rank = re.search(r"Data_rateInSimilarType\s*=\s*\[", txt)
@@ -380,7 +402,6 @@ def _norm(s):
     return re.sub(r"\s+", "", s or "")
 
 def _norm_name(s):
-    """对齐用: 删括号及内容(全/半角)+删空白+小写"""
     s = s or ""
     s = re.sub(r"[（(][^）)]*[）)]", "", s)
     s = re.sub(r"\s+", "", s)
@@ -406,7 +427,7 @@ def _coerce_item(it):
     hp   = g("hold_pnl", "持有收益", "持有盈亏", "累计收益", "累计盈亏", "收益", "pnl", "cum_pnl")
     hpr  = g("hold_pnl_rate_pct", "持有收益率", "累计收益率", "收益率", "收益比例", "rate", "pnl_rate")
     sh   = g("shares", "持有份额", "份额", "hold_shares")
-    cost = g("cost", "持仓成本价", "成本价", "每份成本", "unit_cost", "avg_cost")
+    cost = g("cost", "持仓成本价", "持仓成本", "成本价", "每份成本", "unit_cost", "avg_cost")
     prin = g("principal", "投入本金", "本金", "cost_amount")
     isc  = g("is_cash", "cash")
     typ  = g("asset_class", "类型", "分类", "category")
@@ -424,7 +445,8 @@ def _coerce_item(it):
     return out if (out.get("name") or out.get("code")) else None
 
 def _normalize_snap_doc(raw):
-    """任意json → 标准外壳 {holdings:[标准元素], totals:{amount,n_fund,n_cash}, nav_date}。"""
+    """任意json → 标准外壳 {holdings:[标准元素], totals:{amount,n_fund,n_cash}, nav_date}。
+       （OCR 已移除，此函数暂保留供将来手动导入 json 复用。）"""
     items_raw = []; nav_date = "?"
     if isinstance(raw, list):
         items_raw = raw
@@ -521,6 +543,26 @@ class HistWorker(QThread):
         except Exception as e:
             self.fail.emit(self.code, str(e))
 
+class PnlWorker(QThread):
+    """收益日历后台抓取：每只基金全历史净值 → {日期: 净值}"""
+    progress = Signal(int, int)
+    done = Signal(dict)
+    def __init__(self, codes):
+        super().__init__(); self.codes = list(codes)
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor
+        out = {}
+        def one(code):
+            try:
+                _, hist, _ = fetch_history(code)
+                return code, {datetime.fromtimestamp(ts/1000).strftime("%Y-%m-%d"): nav for ts, nav, _e in hist}
+            except Exception:
+                return code, None
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for i, (code, m) in enumerate(ex.map(one, self.codes)):
+                if m: out[code] = m
+                self.progress.emit(i + 1, len(self.codes))
+        self.done.emit(out)
 
 class IndexWorker(QThread):
     done = Signal(str, str, list); fail = Signal(str, str, str)
@@ -532,6 +574,33 @@ class IndexWorker(QThread):
         except Exception as e:
             tb = traceback.format_exc(limit=2).replace("\n", " ")
             self.fail.emit(self.secid, self.name, f"{type(e).__name__}:{e} | {tb[-150:]}")
+
+
+class UpdateWorker(QThread):
+    found = Signal(str, str)
+    def run(self):
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                headers={"User-Agent": "fund-daily-report", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=3, context=_SSL) as r:
+                d = json.loads(r.read().decode("utf-8", errors="ignore"))
+            tag = (d.get("tag_name") or "").strip().lstrip("vV")
+            print("[update] remote tag =", tag)
+            if tag and self._ver_tuple(tag) > self._ver_tuple(APP_VERSION):
+                self.found.emit(tag, d.get("html_url", ""))
+        except Exception as e:
+            print("[update] fail:", type(e).__name__, e)
+    def _ver_tuple(self, s):
+        t = []
+        for x in (s or "").strip().split("."):
+            n = ""
+            for ch in x:
+                if ch.isdigit(): n += ch
+                else: break
+            t.append(int(n) if n else 0)
+        while len(t) < 3: t.append(0)
+        return tuple(t[:3])
 
 
 class DateAxis(pg.AxisItem):
@@ -645,7 +714,7 @@ class FundCard(QFrame):
             self.setStyleSheet("FundCard{background:#fff;border:1px solid #eee;border-radius:10px;}FundCard:hover{border:1px solid #bcd;}")
             self.btn_detail.setEnabled(True); self.btn_detail.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef3ff;color:#2563eb;border:none;}QPushButton:hover{background:#dbe6ff;}")
 
-    def update_data(self, d, resolved, snap_rec=None):
+    def update_data(self, d, resolved):
         if getattr(self, "_cleared", False): return          # 灰章状态: 行情不覆盖灰章
         self.lbl_name.setText(d.get("name") or "—"); nav = d.get("nav",0)
         if d.get("status") != "ok":
@@ -657,7 +726,6 @@ class FundCard(QFrame):
         self.lbl_nav.setText(f"净值 {nav:.4f}"); self.lbl_nav.setStyleSheet("color:#666;")
         chg = d.get("chg",0); color = RED if chg>0 else (GREEN if chg<0 else GRAY)
         self.lbl_chg.setText(f"{chg:+.2f}%"); self.lbl_chg.setStyleSheet(f"color:{color};")
-        # 净值日期决定显示"今日"还是"截至xx-xx"
         nd = (d.get("nav_date") or "").strip()
         today_str = datetime.now().strftime("%Y-%m-%d")
         if nd and nd == today_str:
@@ -684,33 +752,10 @@ class FundCard(QFrame):
             else:
                 self.lbl_pnl.setText("累计 未填成本"); self.lbl_pnl.setStyleSheet("color:#bbb;")
         else:
-            # 回退: 无手填份额时, 用OCR快照显示(标"≈")
-            if snap_rec and nav and d.get("status") == "ok" and not snap_rec.get("is_cash"):
-                amt = float(snap_rec.get("amount", 0) or 0)
-                if amt > 0:
-                    self.lbl_mv.setText(f"≈持有 ¥{amt:,.2f}"); self.lbl_mv.setStyleSheet("color:#888;")
-                else:
-                    self.lbl_mv.setText(""); self.lbl_mv.setStyleSheet("color:#222;")
-                if amt and (100 + chg):
-                    et = amt * (chg / (100 + chg)); tc = RED if et >= 0 else GREEN
-                    self.lbl_today.setText(f"{day_tag}≈{et:+,.2f}元"); self.lbl_today.setStyleSheet(f"color:{tc};")
-                else:
-                    self.lbl_today.setText(f"{day_tag} —"); self.lbl_today.setStyleSheet("color:#bbb;")
-                hp = snap_rec.get("hold_pnl"); hpr = snap_rec.get("hold_pnl_rate_pct")
-                try: hp_f = float(hp)
-                except Exception: hp_f = None
-                try: hpr_f = float(hpr)
-                except Exception: hpr_f = None
-                if hp_f is not None:
-                    pc = RED if hp_f >= 0 else GREEN
-                    rs = f" ({hpr_f:+.2f}%)" if hpr_f is not None else ""
-                    self.lbl_pnl.setText(f"累计≈{hp_f:+,.2f}元{rs}"); self.lbl_pnl.setStyleSheet(f"color:{pc};")
-                else:
-                    self.lbl_pnl.setText("盈亏 未填持仓"); self.lbl_pnl.setStyleSheet("color:#bbb;")
-            else:
-                self.lbl_mv.setText(""); self.lbl_mv.setStyleSheet("color:#222;")
-                self.lbl_today.setText(f"{day_tag} —"); self.lbl_today.setStyleSheet("color:#bbb;")
-                self.lbl_pnl.setText("盈亏 未填持仓"); self.lbl_pnl.setStyleSheet("color:#bbb;")
+            # 无手填份额 → 提示去管理持仓填写（OCR 快照回退已移除）
+            self.lbl_mv.setText(""); self.lbl_mv.setStyleSheet("color:#222;")
+            self.lbl_today.setText(f"{day_tag} —"); self.lbl_today.setStyleSheet("color:#bbb;")
+            self.lbl_pnl.setText("盈亏 未填持仓"); self.lbl_pnl.setStyleSheet("color:#bbb;")
 
 RANGE_DAYS = {"近1月": 30, "近3月": 90, "近6月": 180, "近1年": 365, "全部": None}
 
@@ -957,6 +1002,7 @@ class DetailPage(QWidget):
                         best = cand
             if best is not None:
                 self._rank_full.append((i, self._rank_by_ts[best]))
+
     def _hide_dd_markers(self):
         for it in (self._zero_line, self._zero_label, self._repair_region, self._dd_marker, self._repair_marker,
                    self._dd_label, self._repair_label, self._region_label):
@@ -1338,11 +1384,12 @@ class HoldDialog(QDialog):
             r = rows[0].row()
         code = self.table.item(r, 1).text().strip()
         name = self.table.item(r, 0).text().strip()
-        dlg = TradeDialog(code, name, self._price.get(code, 0), parent=self)
+        dlg = TradeDialog(self, name, code, "buy")
         if dlg.exec() != QDialog.Accepted or not dlg.result:
             return
-        act, nav, amount, shares, date = dlg.result
-        # 基准取表格当前行(草稿)，不读盘不写盘
+        res = dlg.result()
+        act, nav = res["kind"], res["price"]
+        amount, shares, date = res["amount"], res["share"], res["date"]
         base_sh   = self._num(r, 2)
         base_cost = self._num(r, 3)
         base_prin = self._num(r, 4)
@@ -1359,7 +1406,6 @@ class HoldDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "记账失败", f"{e}")
             return
-        # 只回写表格草稿，落盘由『保存』按钮负责
         self._busy = True
         try:
             self.table.setItem(r, 2, QTableWidgetItem(self._fmt(snap.get("shares", 0))))
@@ -1370,8 +1416,8 @@ class HoldDialog(QDialog):
         finally:
             self._busy = False
         extra = ""
-        if realized[0] is not None: extra = f"　已实现盈亏 {realized[0]:+.4f}"
-        if cashflow[0] is not None: extra = f"　现金流入 {cashflow[0]:+.2f}"
+        if realized[0] is not None: extra = f" 已实现盈亏 {realized[0]:+.4f}"
+        if cashflow[0] is not None: extra = f" 现金流入 {cashflow[0]:+.2f}"
         QMessageBox.information(self, "已记入草稿",
             f"✅ {name}({code}) 已记入本窗草稿（尚未存盘）。\n"
             f"现 份额={snap.get('shares',0):.4f} 成本={snap.get('cost',0):.4f} 本金={snap.get('principal',0):.2f}{extra}\n"
@@ -1432,66 +1478,496 @@ class HoldDialog(QDialog):
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                 if ans != QMessageBox.Yes: return
             d[code] = {"shares": sh, "cost": round(cost,4), "principal": round(prin,2), "buy_date": bd}
-        save_holdings(d); self.saved = True; self.accept()
+        save_holdings(d)
+        self.saved = True
+        self.accept()
+
+
+# ---- 历史净值缓存：补录记账自动带净值 ----
+_HIST_CACHE = {}  # {基金代码: {日期: 单位净值}}
+
+def _fetch_hist_nav_map(code):
+    if code in _HIST_CACHE:
+        return _HIST_CACHE[code]
+    m, errs, raws = {}, [], []
+    UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    def get(url, ref=None):
+        h = dict(UA)
+        if ref:
+            h["Referer"] = ref
+        with urllib.request.urlopen(
+                urllib.request.Request(url, headers=h), timeout=10) as r:
+            return r.read().decode("utf-8", "ignore")
+
+    code = (code or "").strip()
+    if len(code) != 6 or not code.isdigit():
+        raise RuntimeError(f"基金代码无效:[{code}]")
+
+    try:
+        for ps in (500, 20):
+            txt = get(f"https://api.fund.eastmoney.com/f10/lsjz"
+                      f"?fundCode={code}&pageIndex=1&pageSize={ps}",
+                      "https://fundf10.eastmoney.com/")
+            raws.append(f"东财1:len={len(txt)}")
+            data = json.loads(txt)
+            for it in ((data.get("Data") or {}).get("LSJZList") or []):
+                try:
+                    m[str(it.get("FSRQ", "")).strip()] = float(it.get("DWJZ"))
+                except Exception:
+                    pass
+            if m:
+                break
+    except Exception as e:
+        errs.append(f"东财1:{e}")
+
+    if not m:
+        try:
+            txt = get(f"https://fund.eastmoney.com/pingzhongdata/{code}.js",
+                      "https://fund.eastmoney.com/")
+            raws.append(f"东财3:len={len(txt)}")
+            seg = re.search(r'Data_netWorthTrend\s*=\s*(\[.*?\]);', txt, re.S)
+            if seg:
+                for x, y in re.findall(r'"x"\s*:\s*(\d+)\s*,\s*"y"\s*:\s*(-?[\d.]+)',
+                                       seg.group(1)):
+                    ds = datetime.date.fromtimestamp(int(x) / 1000).strftime("%Y-%m-%d")
+                    m.setdefault(ds, float(y))
+        except Exception as e:
+            errs.append(f"东财3:{e}")
+
+    if not m:
+        raise RuntimeError(f"code={code}；{'；'.join(errs) or '可达但解析0条'}"
+                           f"；{' / '.join(raws)}")
+    _HIST_CACHE[code] = m
+    return m
 
 
 class TradeDialog(QDialog):
-    ACTS = [("买入(加仓)", "buy"), ("赎回", "sell"),
-            ("红利再投资", "dividend_reinvest"), ("现金分红", "dividend_cash")]
-    def __init__(self, code, name, nav_now, parent=None):
-        super().__init__(parent); self.setWindowTitle(f"📝 记一笔 · {name} {code}")
-        self.resize(420, 300); self.result = None
-        lay = QVBoxLayout(self)
-        lay.addWidget(QLabel(f"基金：{name}　代码：{code}"))
-        self.cb = QComboBox()
-        for txt, _ in self.ACTS: self.cb.addItem(txt)
-        lay.addWidget(self.cb); self.cb.currentIndexChanged.connect(self._sync_fields)
-        self.e_nav  = QLineEdit(f"{nav_now:.4f}" if nav_now else "")
-        self.e_amt  = QLineEdit()
-        self.e_sh   = QLineEdit()
-        self.e_date = QLineEdit(datetime.now().strftime("%Y-%m-%d"))
-        for lab, w in [("成交净值：", self.e_nav),
-                       ("金额(元, 买入/再投/现金分红用)：", self.e_amt),
-                       ("份额(赎回用)：", self.e_sh),
-                       ("日期(买入=首笔, YYYY-MM-DD)：", self.e_date)]:
-            rr = QHBoxLayout(); rr.addWidget(QLabel(lab)); rr.addWidget(w); lay.addLayout(rr)
-        self._sync_fields()
-        bar = QHBoxLayout(); bar.addStretch()
-        b_ok = QPushButton("确定"); b_ok.clicked.connect(self._ok)
-        b_no = QPushButton("取消"); b_no.clicked.connect(self.reject)
-        bar.addWidget(b_ok); bar.addWidget(b_no); lay.addLayout(bar)
+    """交易录入：买入/卖出 + 日期 + 金额/份额 + 净值（支持补录历史交易）"""
+    def __init__(self, parent, name, code, kind):
+        super().__init__(parent)
+        self.setWindowTitle("记一笔 - " + name)
+        self.resize(470, 340)
+        self._code = code
+        self._price = getattr(parent, "_price", {})
+        L = QVBoxLayout(self); L.setSpacing(8)
 
-    def _sync_fields(self):
-        act = self.ACTS[self.cb.currentIndex()][1]
-        need_amt = act in ("buy", "dividend_reinvest", "dividend_cash")
-        need_sh  = act in ("sell",)
-        need_nav = act in ("buy", "sell", "dividend_reinvest")
-        need_dt  = act == "buy"
-        self.e_amt.setEnabled(need_amt); self.e_sh.setEnabled(need_sh)
-        self.e_nav.setEnabled(need_nav); self.e_date.setEnabled(need_dt)
+        tip = QLabel("口径：15:00 前提交按【当天】净值确认，15:00 后/节假日按【下一交易日】净值确认。\n补录历史交易：日期填确认净值对应的交易日，净值/份额照抄支付宝交易详情即可。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#888; font-size:11px;")
+        L.addWidget(tip)
 
-    def _ok(self):
-        act = self.ACTS[self.cb.currentIndex()][1]
+        H = QHBoxLayout()
+        self.rb_buy = QRadioButton("买入")
+        self.rb_sell = QRadioButton("卖出")
+        (self.rb_buy if kind == "buy" else self.rb_sell).setChecked(True)
+        H.addWidget(self.rb_buy); H.addWidget(self.rb_sell); H.addStretch()
+        L.addLayout(H)
+
+        F = QFormLayout(); F.setLabelAlignment(Qt.AlignRight)
+        self.ed_date = QDateEdit(QDate.currentDate())
+        self.ed_date.setCalendarPopup(True)
+        self.ed_date.setDisplayFormat("yyyy-MM-dd")
+        F.addRow("交易日期", self.ed_date)
+        self.ed_amt = QLineEdit()
+        self.ed_amt.setPlaceholderText("买入=花的钱 卖出=到账的钱")
+        F.addRow("金额(元)", self.ed_amt)
+        self.ed_share = QLineEdit()
+        self.ed_share.setPlaceholderText("选填：可直接抄支付宝【确认份额】；不填按 金额÷净值 算")
+        F.addRow("份额", self.ed_share)
+        self.ed_price = QLineEdit()
+        p0 = self._price.get(code, 0)
+        if p0 > 0: self.ed_price.setText(f"{p0:.4f}")
+        F.addRow("成交净值", self.ed_price)
+        L.addLayout(F)
+
+        self.lbl_hint = QLabel("")
+        self.lbl_hint.setWordWrap(True)
+        self.lbl_hint.setStyleSheet("color:#8a6d00; background:#fff8e1; padding:4px; border-radius:4px;")
+        self.lbl_hint.hide()
+        L.addWidget(self.lbl_hint)
+
+        BB = QHBoxLayout()
+        btn_ok = QPushButton("确定")
+        btn_ok.clicked.connect(self._try_accept)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        BB.addStretch(); BB.addWidget(btn_ok); BB.addWidget(btn_cancel)
+        L.addLayout(BB)
+
+        self.ed_date.dateChanged.connect(self._on_date_changed)
+
+    def _on_date_changed(self, d):
+        if d == QDate.currentDate():
+            p0 = self._price.get(self._code, 0)
+            self.ed_price.setText(f"{p0:.4f}" if p0 > 0 else "")
+            self.lbl_hint.hide()
+            return
+        ds = d.toString("yyyy-MM-dd")
+        err = ""
         try:
-            nav = float(self.e_nav.text()) if self.e_nav.text().strip() else 0.0
-            amt = float(self.e_amt.text()) if self.e_amt.text().strip() else 0.0
-            sh  = float(self.e_sh.text())  if self.e_sh.text().strip()  else 0.0
-        except Exception:
-            QMessageBox.warning(self, "格式", "净值/金额/份额 请填写数字。"); return
-        date = self.e_date.text().strip()
-        if act in ("buy", "dividend_reinvest") and (nav <= 0 or amt <= 0):
-            QMessageBox.warning(self, "缺值", "买入/再投 需要 净值>0 且 金额>0。"); return
-        if act == "sell" and (nav <= 0 or sh <= 0):
-            QMessageBox.warning(self, "缺值", "赎回 需要 净值>0 且 份额>0。"); return
-        if act == "dividend_cash" and amt <= 0:
-            QMessageBox.warning(self, "缺值", "现金分红 需要 金额>0。"); return
-        self.result = (act, nav, amt, sh, date)
+            m = _fetch_hist_nav_map(self._code)
+        except Exception as e:
+            m, err = {}, str(e)
+        nav, used = m.get(ds), ds
+        if not nav:
+            nd = QDate(d)
+            for _ in range(10):
+                nd = nd.addDays(1)
+                v = m.get(nd.toString("yyyy-MM-dd"))
+                if v:
+                    nav, used = v, nd.toString("yyyy-MM-dd")
+                    break
+        if nav:
+            self.ed_price.setText(f"{nav:.4f}")
+            if used == ds:
+                txt = f"✅ 已带出 {ds} 的确认净值：{nav:.4f}；份额可直接抄支付宝【确认份额】（不符可手改）。"
+            else:
+                txt = f"✅ {ds} 为非交易日，按规则已带出下一交易日 {used} 的确认净值：{nav:.4f}。"
+            self.lbl_hint.setStyleSheet("color:#1b5e20; background:#e8f5e9; padding:4px; border-radius:4px;")
+        else:
+            self.ed_price.setText("")
+            txt = f"⚠ 没抓到净值（{err or '未知原因'}）：请先按支付宝交易详情手填。"
+            self.lbl_hint.setStyleSheet("color:#8a6d00; background:#fff8e1; padding:4px; border-radius:4px;")
+        self.lbl_hint.setText(txt)
+        self.lbl_hint.show()
+
+    def _try_accept(self):
+        try: price = float(self.ed_price.text())
+        except ValueError: price = 0
+        if price <= 0:
+            QMessageBox.warning(self, "提示", "成交净值必须大于 0。\n补录历史交易请填该笔的确认净值，不要用今天的净值。")
+            return
+        try: amount = float(self.ed_amt.text() or 0)
+        except ValueError:
+            QMessageBox.warning(self, "提示", "金额必须是数字。")
+            return
+        try: share = float(self.ed_share.text() or 0)
+        except ValueError:
+            QMessageBox.warning(self, "提示", "份额必须是数字。")
+            return
+        if amount < 0 or share < 0:
+            QMessageBox.warning(self, "提示", "金额/份额不能为负数。")
+            return
+        if amount <= 0 and share <= 0:
+            QMessageBox.warning(self, "提示", "【金额】和【份额】至少填一个：买入填金额，卖出可只填份额。")
+            return
         self.accept()
+
+    def result(self):
+        kind = "buy" if self.rb_buy.isChecked() else "sell"
+        date = self.ed_date.date().toString("yyyy-MM-dd")
+        amount = float(self.ed_amt.text() or 0)
+        share = float(self.ed_share.text() or 0)
+        price = float(self.ed_price.text() or 0)
+        return {"kind": kind, "date": date, "amount": amount, "share": share, "price": price}
+
+TRADES_FILE = os.path.join(_BASE, "trades.json")
+
+def load_trades():
+    try:
+        with open(TRADES_FILE, encoding="utf-8") as f: return json.load(f)
+    except Exception: return []
+
+def save_trades(t):
+    with open(TRADES_FILE, "w", encoding="utf-8") as f: json.dump(t, f, ensure_ascii=False, indent=1)
+
+class PnlDialog(QDialog):
+    """收益明细：收益总览 + 收益日历(红涨绿跌) + 当日明细。
+       口径：按当前份额回溯（未考虑历史加减仓），非交易日不显示。"""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("📅 收益明细"); self.resize(900, 720)
+        self._hist = {}; self._days = []; self._sel = None
+        self._ym = (datetime.now().year, datetime.now().month)
+        self._worker = None
+        L = QVBoxLayout(self); L.setSpacing(8)
+        tip = QLabel("口径：当日盈亏 = Σ 当前份额 ×（当日净值 − 前一日净值）。按【当前份额】回溯，加减仓之前的月份仅供参考；灰格 = 非交易日/无数据。")
+        tip.setWordWrap(True); tip.setStyleSheet("color:#888;font-size:10px;"); L.addWidget(tip)
+        ov = QFrame(); ov.setStyleSheet("QFrame{background:#f7f9fc;border-radius:10px;}")
+        ol = QHBoxLayout(ov); ol.setContentsMargins(14,10,14,10)
+        self._ov_lbls = {}
+        for key, name in (("yest","昨日收益"), ("month","本月收益"), ("monthpct","本月收益率"), ("year","本年累计")):
+            box = QVBoxLayout(); box.setSpacing(2)
+            a = QLabel(name); a.setStyleSheet("color:#888;font-size:9px;"); a.setAlignment(Qt.AlignCenter)
+            b = QLabel("—"); b.setFont(QFont("Microsoft YaHei",13,QFont.Bold)); b.setAlignment(Qt.AlignCenter)
+            box.addWidget(a); box.addWidget(b); ol.addLayout(box)
+            self._ov_lbls[key] = b
+        L.addWidget(ov)
+        nav = QHBoxLayout()
+        self.btn_prev = QPushButton("‹"); self.btn_next = QPushButton("›")
+        for b in (self.btn_prev, self.btn_next):
+            b.setFixedWidth(34); b.setFont(QFont("Microsoft YaHei",11,QFont.Bold))
+            b.setStyleSheet("QPushButton{border-radius:7px;background:#f0f0f0;}QPushButton:hover{background:#e3e3e3;}")
+        self.btn_prev.clicked.connect(lambda: self._shift(-1)); self.btn_next.clicked.connect(lambda: self._shift(1))
+        self.lbl_month = QLabel(""); self.lbl_month.setFont(QFont("Microsoft YaHei",12,QFont.Bold)); self.lbl_month.setAlignment(Qt.AlignCenter)
+        nav.addWidget(self.btn_prev); nav.addWidget(self.lbl_month,1); nav.addWidget(self.btn_next); L.addLayout(nav)
+        self.grid = QGridLayout(); self.grid.setSpacing(4)
+        for c, t in enumerate(("日","一","二","三","四","五","六")):
+            h = QLabel(t); h.setAlignment(Qt.AlignCenter); h.setStyleSheet("color:#666;font-weight:bold;")
+            self.grid.addWidget(h, 0, c)
+        self._cells = []
+        for r in range(6):
+            row = []
+            for c in range(7):
+                cell = QLabel(""); cell.setAlignment(Qt.AlignCenter)
+                cell.setFixedSize(96, 54); cell.setCursor(QCursor(Qt.PointingHandCursor))
+                cell.mousePressEvent = lambda ev, rr=r, cc=c: self._click(rr, cc)
+                self.grid.addWidget(cell, r+1, c); row.append(cell)
+            self._cells.append(row)
+        L.addLayout(self.grid)
+        self.lbl_day = QLabel("点日历上某一天，看每只基金当天贡献 ↓")
+        self.lbl_day.setFont(QFont("Microsoft YaHei",10,QFont.Bold)); self.lbl_day.setStyleSheet("color:#333;")
+        L.addWidget(self.lbl_day)
+        self.tbl = QTableWidget(0,4); self.tbl.setHorizontalHeaderLabels(["基金","当日盈亏(元)","当日涨跌","备注"])
+        self.tbl.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch)
+        self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers); self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setAlternatingRowColors(True); self.tbl.setStyleSheet("QTableWidget{font-size:12px;}")
+        L.addWidget(self.tbl,1)
+        self.lbl_status = QLabel(""); self.lbl_status.setStyleSheet("color:#888;font-size:10px;"); L.addWidget(self.lbl_status)
+        bb = QHBoxLayout(); bb.addStretch()
+        b = QPushButton("关闭"); b.clicked.connect(self.reject)
+        b.setStyleSheet("QPushButton{padding:8px 16px;border-radius:8px;background:#2563eb;color:#fff;border:none;}")
+        bb.addWidget(b); L.addLayout(bb)
+
+    def start(self):
+        codes = [c for c, _n in FUNDS if c not in getattr(self.parent(), "_cleared_codes", set())]
+        if not codes:
+            self.lbl_status.setText("⚠ 没有可统计的持仓基金。"); return
+        self._codes = codes
+        self.lbl_status.setText(f"⏳ 抓取历史净值 0/{len(codes)} …")
+        self._worker = PnlWorker(codes)
+        self._worker.progress.connect(self._on_prog)
+        self._worker.done.connect(self._on_done)
+        self._worker.start()
+
+    def _on_prog(self, i, n): self.lbl_status.setText(f"⏳ 抓取历史净值 {i}/{n} …")
+
+    def _on_done(self, out):
+        self._hist = out
+        self._per = {}; self._pnav = {}
+        for code, m in out.items():
+            dd = sorted(m); per = {}; pnav = {}; prev = None
+            for ds in dd:
+                if prev is not None:
+                    per[ds] = (m[ds]-prev)/prev*100 if prev else 0.0
+                    pnav[ds] = prev
+                prev = m[ds]
+            self._per[code] = per; self._pnav[code] = pnav
+        self._days = sorted(set().union(*[set(p) for p in self._per.values()])) if self._per else []
+        self._build_timeline()
+        if not self._days:
+            self.lbl_status.setText("⚠ 没抓到任何历史净值。"); return
+        self._ym = (int(self._days[-1][:4]), int(self._days[-1][5:7]))
+        self._refresh_month(); self._update_overview()
+        self.lbl_status.setText(f"✅ 已加载 {len(out)}/{len(self._codes)} 只基金的历史净值。")
+
+    def _build_timeline(self):
+        """每只基金的份额时间线：有交易记录→按记录推；没有→用持仓buy_date+当前份额近似。
+           注意：trades.json 里 side 存的是英文 buy/sell/open（见 apply_trade）。"""
+        self._tl = {}
+        trades = {}
+        for t in load_trades():
+            trades.setdefault(t["code"], []).append(t)
+        for code in self._hist:
+            m = self._hist[code]; dds = sorted(m)
+            ts = sorted(trades.get(code, []), key=lambda x: x["date"])
+            if ts:
+                shares = 0.0; pts = []
+                for t in ts:
+                    ds = t["date"]
+                    if t["side"] == "open":
+                        shares = float(t.get("shares", 0)); pts.append((ds, shares)); continue
+                    if ds not in m:
+                        cand = [d for d in dds if d <= ds]
+                        ds = cand[-1] if cand else dds[0]
+                    dsh = t["amount"]/m[ds]
+                    shares += dsh if t["side"] == "buy" else -dsh   # ← 修：原为 "买入" 永远不匹配
+                    pts.append((t["date"], max(shares, 0.0)))
+                if pts: self._tl[code] = pts
+                continue
+            rec = self.parent().resolved.get(code, {})
+            sh = float(rec.get("shares") or 0); bd = (load_holdings().get(code, {}) or {}).get("buy_date", "")
+            if sh > 0 and bd: self._tl[code] = [(bd, sh)]
+
+    def _shares_on(self, code, ds):
+        tl = self._tl.get(code)
+        if not tl: return float(self.parent().resolved.get(code, {}).get("shares") or 0)
+        sh = 0.0
+        for d, s in tl:
+            if d <= ds: sh = s
+            else: break
+        return sh
+
+    def _day_pnl(self, ds):
+        tot = 0.0
+        for code, per in self._per.items():
+            if ds not in per: continue
+            sh = self._shares_on(code, ds); pn = self._pnav[code].get(ds)
+            if sh and pn: tot += sh*pn*per[ds]/100
+        return tot
+
+    def _set_ov(self, key, val, pct=False):
+        lb = self._ov_lbls[key]
+        if val is None:
+            lb.setText("—"); lb.setStyleSheet("color:#888;font-weight:bold;"); return
+        lb.setText(f"{val:+.2f}%" if pct else f"{val:+,.2f}")
+        lb.setStyleSheet(f"color:{RED if val>=0 else GREEN};font-weight:bold;")
+
+    def _update_overview(self):
+        if not self._days: return
+        last = self._days[-1]
+        self._set_ov("yest", self._day_pnl(last))
+        ym = last[:7]
+        mp = sum(self._day_pnl(ds) for ds in self._days if ds[:7] == ym)
+        base = 0.0
+        first = next((d for d in self._days if d[:7] == ym), None)
+        if first:
+            for code in self._hist:
+                sh = self._shares_on(code, first); pv = self._pnav.get(code, {}).get(first)
+                if sh and pv: base += sh*pv
+        self._set_ov("month", mp); self._set_ov("monthpct", (mp/base*100) if base else None, pct=True)
+        self._set_ov("year", sum(self._day_pnl(ds) for ds in self._days if ds[:4] == last[:4]))
+
+    def _shift(self, d):
+        y, m = self._ym; m += d
+        if m < 1: y, m = y-1, 12
+        if m > 12: y, m = y+1, 1
+        self._ym = (y, m); self._refresh_month()
+
+    def _refresh_month(self):
+        import calendar as _cal
+        y, m = self._ym
+        self.lbl_month.setText(f"{y}年{m}月")
+        day_pnl = {ds: self._day_pnl(ds) for ds in self._days if ds[:7] == f"{y:04d}-{m:02d}"}
+        vmax = max([abs(v) for v in day_pnl.values() if abs(v) > 1e-9] + [0.01])
+        wd, ndays = _cal.monthrange(y, m)
+        first_wd = (wd + 1) % 7      # monthrange 周一=0 → 日历列 周日=0
+        today = datetime.now().strftime("%Y-%m-%d")
+        for row in self._cells:
+            for cell in row:
+                cell.setText(""); cell.setProperty("ds", ""); cell.setStyleSheet("QLabel{background:#fafafa;border-radius:8px;color:#ddd;}")
+        for d in range(1, ndays+1):
+            ds = f"{y:04d}-{m:02d}-{d:02d}"; idx = first_wd + d - 1
+            cell = self._cells[idx//7][idx%7]; cell.setProperty("ds", ds)
+            if ds in day_pnl and abs(day_pnl[ds]) > 1e-9:
+                v = day_pnl[ds]; a = min(abs(v)/vmax, 1.0)
+                bg = f"rgba(229,57,53,{0.10+0.55*a:.2f})" if v >= 0 else f"rgba(22,163,74,{0.10+0.55*a:.2f})"
+                cell.setText(f"{d}\n{v:+.2f}")
+                cell.setStyleSheet(f"QLabel{{background:{bg};border-radius:8px;color:{RED if v>=0 else GREEN};font-weight:bold;}}QLabel:hover{{border:2px solid #2563eb;}}")
+            elif (idx % 7) in (0, 6) or ds < today:
+                cell.setText(f"{d}\n0.00"); cell.setStyleSheet("QLabel{background:#f5f5f5;border-radius:8px;color:#999;}QLabel:hover{border:2px solid #2563eb;}")
+            else:
+                cell.setText(f"{d}\n—"); cell.setStyleSheet("QLabel{background:#fafafa;border-radius:8px;color:#ccc;}")
+        if self._sel and self._sel[:7] == f"{y:04d}-{m:02d}": self._show_day(self._sel)
+
+    def _click(self, r, c):
+        ds = self._cells[r][c].property("ds") or ""
+        if not ds: return
+        self._sel = ds; self._show_day(ds)
+
+    def _show_day(self, ds):
+        rows = []
+        for code, per in self._per.items():
+            if ds not in per: continue
+            sh = self._shares_on(code, ds); pn = self._pnav[code].get(ds)
+            if not (sh and pn): continue
+            rows.append((NAME_MAP.get(code, code), sh*pn*per[ds]/100, per[ds]))
+        if not rows:
+            self.lbl_day.setText(f"{ds} 休市 / 无持仓"); self.tbl.setRowCount(0); return
+        rows.sort(key=lambda x: -x[1]); tot = sum(x[1] for x in rows)
+        self.lbl_day.setText(f"{ds} 合计 {tot:+,.2f} 元 （{len(rows)} 只有数据）")
+        self.tbl.setRowCount(len(rows))
+        for r, (nm, pnl, pct) in enumerate(rows):
+            self.tbl.setItem(r,0,QTableWidgetItem(nm))
+            it = QTableWidgetItem(f"{pnl:+,.2f}"); it.setForeground(QColor(RED if pnl>=0 else GREEN)); self.tbl.setItem(r,1,it)
+            it = QTableWidgetItem(f"{pct:+.2f}%"); it.setForeground(QColor(RED if pct>=0 else GREEN)); self.tbl.setItem(r,2,it)
+            self.tbl.setItem(r,3,QTableWidgetItem(""))
+
+class TradesDialog(QDialog):
+    """交易记录：查看流水 + 补录历史。
+       补录只写 trades.json，不动当前持仓（历史交易已含在手动持仓里，再过一遍会双计）。
+       新交易在「管理持仓」记一笔时自动进流水，不用在这里重复录。
+       （OCR 截图导入已移除。）"""
+    SIDES = [("buy", "买入"), ("sell", "卖出/赎回"), ("dividend_reinvest", "红利再投"),
+             ("dividend_cash", "现金分红"), ("open", "期初快照")]
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("交易记录")
+        self.resize(780, 560)
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel("补录＝把支付宝里过去的交易抄进来，只影响收益日历，不影响当前持仓。份额必填（照抄支付宝「确认份额」），金额选填。"))
+
+        self.tbl = QTableWidget(0, 5)
+        self.tbl.setHorizontalHeaderLabels(["日期", "基金", "类型", "金额(元)", "份额"])
+        self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        root.addWidget(self.tbl, 1)
+
+        form = QFormLayout()
+        self.d_date = QDateEdit(QDate.currentDate())
+        self.d_date.setCalendarPopup(True); self.d_date.setDisplayFormat("yyyy-MM-dd")
+        self.d_code = QComboBox()
+        for c in sorted(NAME_MAP, key=lambda c: NAME_MAP[c]):
+            self.d_code.addItem(f"{NAME_MAP[c]}（{c}）", c)
+        self.d_side = QComboBox()
+        for k, v in self.SIDES:
+            self.d_side.addItem(v, k)
+        self.d_shares = QLineEdit(); self.d_shares.setPlaceholderText("必填：支付宝里的确认份额")
+        self.d_amount = QLineEdit(); self.d_amount.setPlaceholderText("选填：金额(元)")
+        form.addRow("日期", self.d_date);  form.addRow("基金", self.d_code)
+        form.addRow("类型", self.d_side);  form.addRow("份额", self.d_shares)
+        form.addRow("金额", self.d_amount)
+        root.addLayout(form)
+
+        bar = QHBoxLayout()
+        b_add = QPushButton("➕ 补录一笔"); b_del = QPushButton("🗑 删除选中行")
+        b_add.clicked.connect(self._add); b_del.clicked.connect(self._del)
+        bar.addWidget(b_add); bar.addWidget(b_del); bar.addStretch()
+        root.addLayout(bar)
+        self._reload()
+
+    def _reload(self):
+        ts = sorted(load_trades(), key=lambda t: t.get("date", ""))
+        self.tbl.setRowCount(len(ts))
+        for r, t in enumerate(ts):
+            vals = [t.get("date", ""),
+                    NAME_MAP.get(t.get("code", ""), t.get("code", "")),
+                    dict(self.SIDES).get(t.get("side"), t.get("side", "")),
+                    str(t["amount"]) if t.get("amount") is not None else "",
+                    str(t["shares"]) if t.get("shares") is not None else ""]
+            for c, v in enumerate(vals):
+                self.tbl.setItem(r, c, QTableWidgetItem(v))
+
+    def _add(self):
+        code = self.d_code.currentData(); side = self.d_side.currentData()
+        date = self.d_date.date().toString("yyyy-MM-dd")
+        shs = self.d_shares.text().strip(); amt = self.d_amount.text().strip()
+        if side != "dividend_cash" and not shs:
+            QMessageBox.warning(self, "提示", "请先填份额（现金分红除外）。"); return
+        rec = {"date": date, "code": code, "side": side}
+        if shs: rec["shares"] = float(shs)
+        if amt: rec["amount"] = round(float(amt), 2)
+        all_t = load_trades(); all_t.append(rec); save_trades(all_t)
+        self.d_shares.clear(); self.d_amount.clear()
+        self._reload()
+
+    def _del(self):
+        r = self.tbl.currentRow()
+        if r < 0: return
+        ts = sorted(load_trades(), key=lambda t: t.get("date", ""))
+        t = ts[r]
+        name = NAME_MAP.get(t.get("code", ""), t.get("code", ""))
+        if QMessageBox.question(self, "删除", f"删除 {t.get('date')} {name} 的这笔记录？") == QMessageBox.Yes:
+            all_t = load_trades(); all_t.remove(t); save_trades(all_t)
+            self._reload()
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("我的基金助手"); self.resize(1320,900)
+        super().__init__(); self.setWindowTitle("基金日报"); self.resize(1320,900)
         s = QApplication.primaryScreen().geometry(); self.move(max(0,(s.width()-1320)//2),max(0,(s.height()-900)//2))
         pg.setConfigOptions(antialias=True)
         root = QWidget(); self.setCentralWidget(root)
@@ -1502,11 +1978,28 @@ class MainWindow(QMainWindow):
         self.worker = None; self.last_results = []; self.resolved = {}; self.corrected_codes = set()
         self._cleared_codes = load_show_state()
         self._refresh_home()
+        self._check_update()
+
+    def _check_update(self):
+        self._upd_worker = UpdateWorker(); self._upd_worker.found.connect(self._on_update_found); self._upd_worker.start()
+
+    def _on_update_found(self, tag, url):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("发现新版本")
+        msg.setIcon(QMessageBox.Information)
+        msg.setText(f"🎉 v{tag} 已发布（当前 v{APP_VERSION}）。\n点「去下载」打开下载页。")
+        yes = msg.addButton("去下载", QMessageBox.YesRole)
+        msg.addButton("跳过", QMessageBox.NoRole)
+        msg.exec()
+        if msg.clickedButton() is yes and url:
+            import webbrowser; webbrowser.open(url)
 
     def _build_home(self):
         w = QWidget(); outer = QVBoxLayout(w); outer.setContentsMargins(18,16,18,16); outer.setSpacing(12)
         top = QHBoxLayout()
-        title = QLabel("📊  我的基金助手"); title.setFont(QFont("Microsoft YaHei",16,QFont.Bold)); top.addWidget(title); top.addStretch()
+        title = QLabel("📊  基金日报"); title.setFont(QFont("Microsoft YaHei",16,QFont.Bold)); top.addWidget(title); top.addStretch()
+        ver = QLabel(f"v{APP_VERSION}"); ver.setFont(QFont("Microsoft YaHei", 9)); ver.setStyleSheet("color:#999;")
+        top.addWidget(ver)
         self.lbl_time = QLabel(""); self.lbl_time.setStyleSheet("color:#999;"); top.addWidget(self.lbl_time)
         self.btn_hold = QPushButton("💼 管理持仓"); self.btn_hold.setFont(QFont("Microsoft YaHei",9))
         self.btn_hold.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef9f0;color:#16a34a;border:none;}QPushButton:hover{background:#dcf3e1;}")
@@ -1514,9 +2007,14 @@ class MainWindow(QMainWindow):
         self.btn_diag = QPushButton("🩺 诊断"); self.btn_diag.setFont(QFont("Microsoft YaHei",9))
         self.btn_diag.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#f0f0f0;border:none;}QPushButton:hover{background:#e3e3e3;}")
         self.btn_diag.clicked.connect(self._show_diag); top.addWidget(self.btn_diag)
-        self.btn_snap = QPushButton("📸 最新快照"); self.btn_snap.setFont(QFont("Microsoft YaHei",9))
-        self.btn_snap.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#f5f3ff;color:#7c3aed;border:none;}QPushButton:hover{background:#ede9fe;}")
-        self.btn_snap.clicked.connect(self._open_snapshot); top.addWidget(self.btn_snap)
+        self.btn_pnl = QPushButton("📅 收益明细"); self.btn_pnl.setFont(QFont("Microsoft YaHei",9))
+        self.btn_pnl.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#fff7ed;color:#ea580c;border:none;}QPushButton:hover{background:#ffedd5;}")
+        self.btn_pnl.clicked.connect(self._open_pnl); top.addWidget(self.btn_pnl)
+        self.btn_trades = QPushButton("📒 交易记录")
+        self.btn_trades.clicked.connect(lambda: TradesDialog(self).exec());top.addWidget(self.btn_trades)
+        self.btn_trades.setFont(QFont("Microsoft YaHei",9))
+        self.btn_trades.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef2ff;color:#4f46e5;border:none;}QPushButton:hover{background:#e0e7ff;}")
+        # 「📸 最新快照」按钮已随 OCR 一并移除
         self.btn_refresh = QPushButton("🔄  刷新数据"); self.btn_refresh.setFont(QFont("Microsoft YaHei",10))
         self.btn_refresh.setStyleSheet("QPushButton{padding:9px 16px;border-radius:8px;background:#2563eb;color:#fff;border:none;}QPushButton:hover{background:#1d4ed8;}QPushButton:disabled{background:#bbb;}")
         self.btn_refresh.clicked.connect(self._refresh_home); top.addWidget(self.btn_refresh); outer.addLayout(top)
@@ -1529,12 +2027,10 @@ class MainWindow(QMainWindow):
         self.lbl_fix.setWordWrap(True); self.lbl_fix.hide(); outer.addWidget(self.lbl_fix)
         self.lbl_alert = QLabel(""); self.lbl_alert.setStyleSheet("QLabel{color:#b3261e;background:#fdecea;border:1px solid #f5b7b1;border-radius:8px;padding:8px 12px;}")
         self.lbl_alert.setWordWrap(True); self.lbl_alert.hide(); outer.addWidget(self.lbl_alert)
-        # 左右分栏: 左=涨跌统计/榜单, 右=逐只卡片明细(中间竖线可拖)
         split = QSplitter(Qt.Horizontal)
         left_scroll = QScrollArea(); left_scroll.setWidgetResizable(True); left_scroll.setMinimumWidth(380)
         left_scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
         left_wrap = QWidget(); left_col = QVBoxLayout(left_wrap); left_col.setContentsMargins(0,0,0,0); left_col.setSpacing(10)
-        # 快速添加 / 移除自加基金(左栏顶)
         add_box = QFrame(); add_box.setStyleSheet("QFrame{background:#fff;border:1px solid #eee;border-radius:10px;}")
         abl = QHBoxLayout(add_box); abl.setContentsMargins(12,10,12,10)
         atitle = QLabel("➕ 快速添加"); atitle.setFont(QFont("Microsoft YaHei",9,QFont.Bold)); abl.addWidget(atitle)
@@ -1562,27 +2058,7 @@ class MainWindow(QMainWindow):
         self._green_rows = [QLabel("—") for _ in range(3)]
         for lb in self._green_rows: lb.setFont(QFont("Microsoft YaHei",9)); lb.setStyleSheet("color:#15803d;"); self._green_col.addWidget(lb)
         bl.addLayout(self._red_col); bl.addSpacing(20); bl.addLayout(self._green_col); left_col.addWidget(self.board)
-        # 快照全貌区(只读, 不参与盈亏计算)
-        self.lbl_snap_total = QLabel("")
-        self.lbl_snap_total.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
-        self.lbl_snap_total.setStyleSheet("QLabel{color:#5b21b6;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px;padding:8px 12px;}")
-        self.lbl_snap_total.setWordWrap(True); self.lbl_snap_total.hide()
-        left_col.addWidget(self.lbl_snap_total)
-        self.snap_box = QFrame(); self.snap_box.setStyleSheet("QFrame{background:#fff;border:1px solid #eee;border-radius:10px;}")
-        _sbl = QVBoxLayout(self.snap_box); _sbl.setContentsMargins(10,8,10,8)
-        _sbtitle = QLabel("📸 支付宝持有全貌（快照·只读·与上方实时卡片对照；不参与盈亏计算）")
-        _sbtitle.setFont(QFont("Microsoft YaHei", 9, QFont.Bold)); _sbtitle.setStyleSheet("color:#7c3aed;")
-        _sbl.addWidget(_sbtitle)
-        self.snap_table = QTableWidget(0, 4)
-        self.snap_table.setHorizontalHeaderLabels(["名称", "金额(元)", "今日收益", "持有收益"])
-        self.snap_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.snap_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.snap_table.setAlternatingRowColors(True); self.snap_table.verticalHeader().setVisible(False)
-        self.snap_table.setStyleSheet("QTableWidget{font-size:12px;}")
-        self.snap_table.setFixedHeight(170)
-        _sbl.addWidget(self.snap_table)
-        left_col.addWidget(self.snap_box)
-        self.snap_box.hide()
+        # 快照全貌区已随 OCR 移除（lbl_snap_total / snap_box 不再创建）
         left_col.addStretch()
         left_scroll.setWidget(left_wrap); split.addWidget(left_scroll)
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setMinimumWidth(440)
@@ -1647,67 +2123,18 @@ class MainWindow(QMainWindow):
         if sum(1 for r in results if r.get("status")=="ok") == 0:
             QMessageBox.warning(self,"没抓到数据","全部抓取失败，请点「🩺 诊断」。")
 
-    def _build_snap_index(self):
-        """读最新OCR快照, 按名字对齐到code, 供『手填为空时回退显示』。
-           手填优先: 只有 resolved 无份额的基金, 卡片/汇总才回退用这里的值。"""
-        self._snap_by_code = {}; self._snap_total_amount = 0.0
-        self._snap_nav_date = "?"; self._snap_unmatched = []
-        raw = None
-        doc = _normalize_snap_doc(raw) if raw is not None else None
-        if not (isinstance(doc, dict) and doc.get("holdings")):
-            try: raw = _load_snap()
-            except Exception: raw = None
-            doc = _normalize_snap_doc(raw) if raw is not None else None
-        if not (isinstance(doc, dict) and doc.get("holdings")):
-            return
-        snap_list = doc.get("holdings", []) or []
-        fund_codes = {c for c, _ in FUNDS}
-        by_code = {}; used = set()
-        for j, it in enumerate(snap_list):                            # 6位代码精确对齐
-            cd = str(it.get("code", "")).strip()
-            if cd in fund_codes and cd not in by_code:
-                by_code[cd] = it; used.add(j)
-        norm_snap = [(i, _norm_name(it.get("name", "")), it) for i, it in enumerate(snap_list) if isinstance(it, dict)]
-        norm_funds = [(code, _norm_name(name)) for code, name in FUNDS if code not in by_code]
-        for code, nf in norm_funds:                                   # 名字归一化精确
-            for j, ns, it in norm_snap:
-                if j in used: continue
-                if nf and ns and nf == ns:
-                    by_code[code] = it; used.add(j); break
-        import difflib                                                # 名字模糊贪心
-        rem_f = [(c, nf) for c, nf in norm_funds if c not in by_code]
-        rem_s = [(j, ns, it) for j, ns, it in norm_snap if j not in used]
-        pairs = []
-        for c, nf in rem_f:
-            for j, ns, it in rem_s:
-                if nf and ns:
-                    pairs.append((difflib.SequenceMatcher(None, nf, ns).ratio(), c, j, it))
-        pairs.sort(key=lambda x: x[0], reverse=True)
-        for r, c, j, it in pairs:
-            if c in by_code or j in used: continue
-            if r >= 0.6:
-                by_code[c] = it; used.add(j)
-        self._snap_by_code = by_code
-        self._snap_unmatched = [c for c, _ in FUNDS if c not in by_code]
-        tot = doc.get("totals", {}) or {}
-        try: self._snap_total_amount = float(tot.get("amount", 0) or 0)
-        except Exception: self._snap_total_amount = 0.0
-        self._snap_nav_date = doc.get("nav_date", "?")
-
     def _apply_results(self):
         price_map = {d["code"]: d.get("nav",0) for d in self.last_results if d.get("status")=="ok"}
         self.resolved, self.corrected_codes = resolve_holdings(load_holdings(), price_map)
-        self._build_snap_index()
         self._cleared_codes = load_show_state()
         act = [d for d in self.last_results if d["code"] not in self._cleared_codes]
         for d in act:
             c = self.cards.get(d["code"])
-            if c: c.update_data(d, self.resolved, self._snap_by_code.get(d["code"]))
+            if c: c.update_data(d, self.resolved)
         self.chart.draw([(d.get("name",d["code"])[:8], d.get("chg",0)) for d in act], animate=True)
         self._update_summary(self.last_results)
         self._update_board(self.last_results)
         self._update_alert(self.last_results)
-        self._fill_snapshot_panel()
         if self.corrected_codes:
             self.lbl_fix.setText(f"🔧 检测到 {len(self.corrected_codes)} 只填的是『本金』(含份额≈1 的撞车行)，已按『每份成本』显示盈亏（卡片带🔧）。点「💼 管理持仓」核对并保存，即可永久修正。")
             self.lbl_fix.show()
@@ -1743,13 +2170,6 @@ class MainWindow(QMainWindow):
                     pct = (nav-cost)/cost*100
                     if pct <= -15:
                         alerts.append(f"🕳 {name[:8]} 已深套 {pct:.0f}%")
-            else:
-                it = (getattr(self, "_snap_by_code", {}) or {}).get(d["code"])
-                if it and not it.get("is_cash") and d["code"] not in clr:
-                    try: hpr_f = float(it.get("hold_pnl_rate_pct"))
-                    except Exception: hpr_f = None
-                    if hpr_f is not None and hpr_f <= -15:
-                        alerts.append(f"🕳 {name[:8]} 已深套 {hpr_f:.0f}%（快照）")
         if alerts:
             self.lbl_alert.setText("  ｜  ".join(alerts[:4])); self.lbl_alert.show()
         else:
@@ -1773,67 +2193,28 @@ class MainWindow(QMainWindow):
             _tag = "今日盈亏" if (_nd == datetime.now().strftime("%Y-%m-%d")) else (f"盈亏(截至{_nd[5:]})" if _nd else "今日盈亏")
             self.lbl_today.setText(f"{_tag}  {today_pnl:+,.2f}元"); self.lbl_today.setStyleSheet(f"color:{pc};")
         else:
-            snap = getattr(self, "_snap_by_code", {}) or {}
-            tot_amt = getattr(self, "_snap_total_amount", 0.0) or 0.0
-            nav_date = getattr(self, "_snap_nav_date", "?")
-            if snap and tot_amt > 0:
-                est = 0.0
-                for d in results:
-                    if d["code"] in clr: continue
-                    it = snap.get(d["code"]); chg = d.get("chg", 0)
-                    if it and d.get("status") == "ok" and not it.get("is_cash"):
-                        amt = float(it.get("amount", 0) or 0)
-                        est += amt * (chg / (100 + chg)) if (100 + chg) else 0
-                self.lbl_total.setText(f"总持仓市值  ¥{tot_amt:,.2f}（快照{nav_date}·OCR）")
-                self.lbl_total.setStyleSheet("color:#222;")
-                pc = RED if est >= 0 else GREEN
-                self.lbl_today.setText(f"今日盈亏≈ {est:+,.2f}元（估算）"); self.lbl_today.setStyleSheet(f"color:{pc};")
+            # 无手填持仓 → 显示平均涨跌（OCR 快照回退已移除）
+            self.lbl_total.setText("总持仓市值  未填持仓"); self.lbl_total.setStyleSheet("color:#999;font-size:12px;")
+            chgs=[d.get("chg",0) for d in results if d.get("status")=="ok"]
+            if chgs:
+                avg=sum(chgs)/len(chgs); pc=RED if avg>=0 else GREEN
+                self.lbl_today.setText(f"今日平均涨跌  {avg:+.2f}%（{len(chgs)}只）"); self.lbl_today.setStyleSheet(f"color:{pc};")
             else:
-                self.lbl_total.setText("总持仓市值  未填持仓"); self.lbl_total.setStyleSheet("color:#999;font-size:12px;")
-                chgs=[d.get("chg",0) for d in results if d.get("status")=="ok"]
-                if chgs:
-                    avg=sum(chgs)/len(chgs); pc=RED if avg>=0 else GREEN
-                    self.lbl_today.setText(f"今日平均涨跌  {avg:+.2f}%（{len(chgs)}只）"); self.lbl_today.setStyleSheet(f"color:{pc};")
-                else:
-                    self.lbl_today.setText("今日盈亏  —"); self.lbl_today.setStyleSheet("color:#999;")
+                self.lbl_today.setText("今日盈亏  —"); self.lbl_today.setStyleSheet("color:#999;")
 
-    def _open_snapshot(self):
-        SnapshotDialog(self).exec()
-
-    def _fill_snapshot_panel(self):
-        try:
-            doc = _load_snap()
-        except Exception:
-            doc = None
-        if not doc or not isinstance(doc, dict):
-            self.lbl_snap_total.hide(); self.snap_box.hide(); return
-        h = doc.get("holdings", []) or []
-        tot = doc.get("totals", {}) or {}
-        nav_date = doc.get("nav_date", "?")
-        try:
-            tot_amt = float(tot.get("amount", 0))
-        except Exception:
-            tot_amt = 0.0
-        n_fund = tot.get("n_fund", "?"); n_cash = tot.get("n_cash", "?")
-        if tot_amt > 0:
-            um = getattr(self, "_snap_unmatched", []) or []
-            um_txt = f"　⚠OCR未对齐{len(um)}只(回退缺这几只)" if um else ""
-            self.lbl_snap_total.setText(
-                f"📸 支付宝全貌（快照 {nav_date}）  ¥{tot_amt:,.2f}　｜　基金 {n_fund} + 现金 {n_cash}　｜　上方『总持仓市值』仅含你已建模并填成本的部分{um_txt}")
-            self.lbl_snap_total.show()
-        else:
-            self.lbl_snap_total.hide()
-        self.snap_box.hide()
+    def _open_pnl(self):
+        d = PnlDialog(self); d.show(); d.start()
 
     def _open_hold(self):
         price_map = {d["code"]: d.get("nav",0) for d in self.last_results if d.get("status")=="ok"}
-        dlg = HoldDialog(self.resolved, self.corrected_codes, price_map, self); dlg.exec()
-        if dlg.saved: self._apply_results()
+        dlg = HoldDialog(self.resolved, self.corrected_codes, price_map, self)
+        dlg.finished.connect(lambda _: self._refresh_home() if dlg.saved else None)
+        dlg.exec()
 
     def _open_detail(self, code): self.detail.load(code, self.resolved.get(code, {})); self.stack.setCurrentIndex(1)
     def _go_home(self): self.stack.setCurrentIndex(0)
+
     def _redraw_aggregates(self):
-        # 添加/删除后, 用当前 last_results 重画 柱状图/红黑榜/汇总/告警(不重抓)
         self.chart.draw([(d.get("name",d["code"])[:8], d.get("chg",0)) for d in self.last_results], animate=False)
         self._update_board(self.last_results); self._update_summary(self.last_results); self._update_alert(self.last_results)
 
@@ -1858,7 +2239,7 @@ class MainWindow(QMainWindow):
         card.btn_clear.clicked.connect(lambda checked, cd=code: self._toggle_cleared(cd))
         self.cards_layout.insertWidget(self.cards_layout.count()-1, card)
         self.cards[code] = card
-        card.update_data(r, self.resolved, (getattr(self,"_snap_by_code",{}) or {}).get(code))
+        card.update_data(r, self.resolved)
         self.last_results.append(r)
         self._redraw_aggregates(); self._add_input.clear()
         QMessageBox.information(self,"已添加",
