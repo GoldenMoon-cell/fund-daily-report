@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*- 
+# -*- coding: utf-8 -*-
 """基金日报助手 - 桌面版
 本地化的基金持仓看板与日报工具：实时估值/历史净值/回撤修复/同类排名/指数对比，
 持仓本地存储，支持粘贴导入、交易记账、已清仓标记。
@@ -67,7 +67,7 @@ NAME_MAP = {c: n for c, n in FUNDS}
 
 HOLD_FILE = "我的持仓.json"
 SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席=默认，不碰持仓账本
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -175,8 +175,14 @@ def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
     prin = float(h.get("principal", 0) or 0)
 
     if action == "buy":
-        add_sh = float(amount) / float(nav)
-        new_prin = prin + float(amount)
+        if amount:
+            add_sh = float(amount) / float(nav)
+            new_prin = prin + float(amount)
+        elif shares:
+            add_sh = float(shares)
+            new_prin = prin + add_sh * float(nav)
+        else:
+            raise ValueError("买入需填金额或份额")
         new_sh = sh + add_sh
         new_cost = (new_prin / new_sh) if new_sh else 0.0
         h["shares"], h["cost"], h["principal"] = new_sh, new_cost, new_prin
@@ -586,11 +592,10 @@ class UpdateWorker(QThread):
             with urllib.request.urlopen(req, timeout=3, context=_SSL) as r:
                 d = json.loads(r.read().decode("utf-8", errors="ignore"))
             tag = (d.get("tag_name") or "").strip().lstrip("vV")
-            print("[update] remote tag =", tag)
             if tag and self._ver_tuple(tag) > self._ver_tuple(APP_VERSION):
                 self.found.emit(tag, d.get("html_url", ""))
-        except Exception as e:
-            print("[update] fail:", type(e).__name__, e)
+        except Exception:
+            pass  # 无网/失败静默跳过；windowed 版无 stdout，绝不可 print
     def _ver_tuple(self, s):
         t = []
         for x in (s or "").strip().split("."):
@@ -985,6 +990,7 @@ class DetailPage(QWidget):
         self._dd_state = "fixing" if p >= REPAIR_THRESHOLD else "no"
 
     def _compute_rank(self):
+        self._rank_full = []
         if not self._rank_by_ts or not self._hist:
             return
         rkeys = sorted(self._rank_by_ts.keys())
@@ -1781,8 +1787,11 @@ class PnlDialog(QDialog):
                     if ds not in m:
                         cand = [d for d in dds if d <= ds]
                         ds = cand[-1] if cand else dds[0]
-                    dsh = t["amount"]/m[ds]
-                    shares += dsh if t["side"] == "buy" else -dsh   # ← 修：原为 "买入" 永远不匹配
+                    amt = t.get("amount")
+                    if not amt or m[ds] <= 0:
+                        pts.append((t["date"], max(shares, 0.0))); continue
+                    dsh = amt/m[ds]
+                    shares += dsh if t["side"] == "buy" else -dsh
                     pts.append((t["date"], max(shares, 0.0)))
                 if pts: self._tl[code] = pts
                 continue
@@ -1965,6 +1974,185 @@ class TradesDialog(QDialog):
             self._reload()
 
 
+# ---------- 导出 Excel ----------
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+def _write_xlsx(path, sections, parent):
+    """sections: list of (key, title) ; parent: MainWindow。每个 section 一个 sheet。"""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)  # 移除默认 sheet
+    HEADER_FONT = Font(bold=True, color="FFFFFF")
+    HEADER_FILL = PatternFill("solid", fgColor="4F81BD")
+    HEADER_ALIGN = Alignment(horizontal="center", vertical="center")
+    EMPTY_FONT = Font(italic=True, color="999999")
+
+    def style_sheet(ws, headers, rows):
+        ws.append(headers)
+        for c in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.font = HEADER_FONT; cell.fill = HEADER_FILL; cell.alignment = HEADER_ALIGN
+        for r in rows:
+            ws.append(r)
+        ws.freeze_panes = "A2"
+        for i, _ in enumerate(headers, 1):
+            col = get_column_letter(i)
+            maxlen = max((len(str(ws.cell(r, i).value or "")) for r in range(1, ws.max_row + 1)), default=8)
+            ws.column_dimensions[col].width = min(maxlen + 2, 40)
+
+    def write_empty(ws, msg):
+        ws.cell(1, 1, msg).font = EMPTY_FONT
+
+    for key, title in sections:
+        ws = wb.create_sheet(title=title[:31])  # sheet 名 <=31 字符
+        if key == "holdings":
+            d = load_holdings()
+            if not d:
+                write_empty(ws, "暂无持仓记录（在「💼 管理持仓」填写后导出）")
+                continue
+            rows = []
+            for code in sorted(d):
+                r = d[code]; sh = r.get("shares", 0); cost = r.get("cost", 0)
+                prin = r.get("principal", 0); bd = r.get("buy_date", "")
+                rows.append([code, sh, cost, prin if prin is not None else "", bd])
+            style_sheet(ws, ["基金代码", "份额", "每份成本", "本金", "买入日期"], rows)
+        elif key == "trades":
+            t = load_trades()
+            if not t:
+                write_empty(ws, "暂无交易记录（在「📒 交易记录」补录后导出）")
+                continue
+            side_map = {"buy": "买入", "sell": "卖出", "open": "期初",
+                        "dividend_reinvest": "红利再投", "dividend_cash": "现金分红"}
+            rows = []
+            for it in sorted(t, key=lambda x: x.get("date", "")):
+                rows.append([it.get("date", ""), it.get("code", ""),
+                             side_map.get(it.get("side", ""), it.get("side", "")),
+                             it.get("amount", ""), it.get("shares", "")])
+            style_sheet(ws, ["日期", "基金代码", "类型", "金额", "份额"], rows)
+        elif key == "pnl":
+            pnl = getattr(parent, "_pnl_dialog", None)
+            hist = getattr(pnl, "_hist", None) if pnl else None
+            days = getattr(pnl, "_days", []) if pnl else []
+            if not hist or not days:
+                write_empty(ws, "暂无收益明细（请先打开「📅 收益明细」并等待抓取完成）")
+                continue
+            per = pnl._per; pnav = pnl._pnav; tl = pnl._tl
+            name_map = NAME_MAP
+            rows = []
+            for ds in days:
+                for code in sorted(hist):
+                    if ds not in per.get(code, {}):
+                        continue
+                    sh = pnl._shares_on(code, ds)
+                    pn = pnav[code].get(ds)
+                    if not (sh and pn):
+                        continue
+                    pnl_val = sh * pn * per[code][ds] / 100
+                    rows.append([ds, code, name_map.get(code, code), hist[code].get(ds, ""),
+                                 pn, per[code][ds], round(pnl_val, 2)])
+            if not rows:
+                write_empty(ws, "收益明细抓取完成但无可用数据")
+                continue
+            style_sheet(ws, ["日期", "基金代码", "基金名称", "当日净值", "前一日净值", "涨跌幅%", "当日盈亏"], rows)
+        elif key == "snapshot":
+            results = getattr(parent, "last_results", [])
+            if not results:
+                write_empty(ws, "暂无行情快照（点「🔄 刷新数据」后再导出）")
+                continue
+            rows = []
+            for r in results:
+                rows.append([r.get("code", ""), r.get("name", ""), r.get("nav", 0),
+                             r.get("est", 0), r.get("chg", 0), r.get("nav_date", ""),
+                             r.get("status", ""), r.get("via", "")])
+            style_sheet(ws, ["基金代码", "名称", "净值", "估值", "涨跌幅%", "净值日期", "状态", "来源"], rows)
+    wb.save(path)
+
+
+class ExportDialog(QDialog):
+    SECTIONS = [("holdings", "持仓"), ("trades", "交易流水"),
+                ("pnl", "收益明细"), ("snapshot", "行情快照")]
+
+    def __init__(self, parent=None):
+        super().__init__(parent); self.setWindowTitle("📥 导出 Excel"); self.resize(520, 380)
+        self._parent = parent
+        lay = QVBoxLayout(self); lay.setSpacing(12)
+        lay.addWidget(QLabel("勾选要导出的数据，选好保存路径，点「导出」生成一个 xlsx 文件（每个数据一个 sheet）。"))
+        # 复选框
+        self._checks = {}
+        pnl = getattr(parent, "_pnl_dialog", None)
+        has_pnl = bool(pnl) and bool(getattr(pnl, "_hist", None))
+        for key, title in self.SECTIONS:
+            cb = QCheckBox(title); cb.setFont(QFont("Microsoft YaHei", 10))
+            if key == "pnl" and not has_pnl:
+                cb.setEnabled(False)
+                cb.setToolTip("请先打开「📅 收益明细」并等待抓取完成，再回来导出")
+                cb.setText(f"{title}（需先打开收益明细）")
+            elif key == "snapshot" and not getattr(parent, "last_results", None):
+                cb.setToolTip("点「🔄 刷新数据」后再导出")
+            cb.setChecked(key != "pnl" or has_pnl)
+            lay.addWidget(cb); self._checks[key] = cb
+        # 路径选择
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("保存到："))
+        self._ed_path = QLineEdit()
+        default_name = f"基金日报导出_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        self._ed_path.setText(os.path.join(_BASE, default_name))
+        self._ed_path.setStyleSheet("QLineEdit{padding:6px 8px;border:1px solid #ddd;border-radius:7px;}")
+        path_row.addWidget(self._ed_path, 1)
+        b_browse = QPushButton("浏览…")
+        b_browse.clicked.connect(self._browse)
+        b_browse.setStyleSheet("QPushButton{padding:6px 12px;border-radius:7px;background:#f0f0f0;border:none;}QPushButton:hover{background:#e3e3e3;}")
+        path_row.addWidget(b_browse)
+        lay.addLayout(path_row)
+        # 状态
+        self._lbl_status = QLabel(""); self._lbl_status.setWordWrap(True)
+        self._lbl_status.setStyleSheet("color:#888;"); lay.addWidget(self._lbl_status)
+        # 按钮
+        bar = QHBoxLayout(); bar.addStretch()
+        b_cancel = QPushButton("取消"); b_cancel.clicked.connect(self.reject)
+        b_cancel.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#f0f0f0;border:none;}")
+        bar.addWidget(b_cancel)
+        b_export = QPushButton("📥 导出"); b_export.clicked.connect(self._do_export)
+        b_export.setStyleSheet("QPushButton{padding:8px 16px;border-radius:8px;background:#0891b2;color:#fff;border:none;}QPushButton:hover{background:#0e7490;}QPushButton:disabled{background:#bbb;}")
+        bar.addWidget(b_export); lay.addLayout(bar)
+        self._b_export = b_export
+
+    def _browse(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "选择保存位置", self._ed_path.text(), "Excel 文件 (*.xlsx)")
+        if path:
+            if not path.lower().endswith(".xlsx"):
+                path += ".xlsx"
+            self._ed_path.setText(path)
+
+    def _do_export(self):
+        sections = [(k, t) for k, t in self.SECTIONS if self._checks[k].isChecked()]
+        if not sections:
+            self._lbl_status.setStyleSheet("color:#e53935;")
+            self._lbl_status.setText("⚠ 请至少勾选一项要导出的数据")
+            return
+        path = self._ed_path.text().strip()
+        if not path:
+            self._lbl_status.setStyleSheet("color:#e53935;")
+            self._lbl_status.setText("⚠ 请选择保存路径")
+            return
+        self._b_export.setEnabled(False); self._lbl_status.setStyleSheet("color:#888;")
+        self._lbl_status.setText("⏳ 导出中…"); QApplication.processEvents()
+        try:
+            _write_xlsx(path, sections, self._parent)
+            size = os.path.getsize(path)
+            size_str = f"{size/1024:.1f} KB" if size < 1024 * 1024 else f"{size/1024/1024:.2f} MB"
+            self._lbl_status.setStyleSheet("color:#16a34a;")
+            self._lbl_status.setText(f"✅ 导出成功：{path}（{size_str}，{len(sections)} 个 sheet）")
+            QMessageBox.information(self, "导出成功", f"已导出到： {path}  |  大小：{size_str}  |  包含 {len(sections)} 个 sheet。")
+        except Exception as e:
+            self._lbl_status.setStyleSheet("color:#e53935;")
+            self._lbl_status.setText(f"⚠ 导出失败：{e}")
+        finally:
+            self._b_export.setEnabled(True)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__(); self.setWindowTitle("基金日报"); self.resize(1320,900)
@@ -1977,6 +2165,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.home); self.stack.addWidget(self.detail)
         self.worker = None; self.last_results = []; self.resolved = {}; self.corrected_codes = set()
         self._cleared_codes = load_show_state()
+        self._pnl_dialog = None
         self._refresh_home()
         self._check_update()
 
@@ -2014,6 +2203,10 @@ class MainWindow(QMainWindow):
         self.btn_trades.clicked.connect(lambda: TradesDialog(self).exec());top.addWidget(self.btn_trades)
         self.btn_trades.setFont(QFont("Microsoft YaHei",9))
         self.btn_trades.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef2ff;color:#4f46e5;border:none;}QPushButton:hover{background:#e0e7ff;}")
+        self.btn_export = QPushButton("📥 导出")
+        self.btn_export.clicked.connect(self._open_export); top.addWidget(self.btn_export)
+        self.btn_export.setFont(QFont("Microsoft YaHei",9))
+        self.btn_export.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#ecfeff;color:#0891b2;border:none;}QPushButton:hover{background:#cffafe;}")
         # 「📸 最新快照」按钮已随 OCR 一并移除
         self.btn_refresh = QPushButton("🔄  刷新数据"); self.btn_refresh.setFont(QFont("Microsoft YaHei",10))
         self.btn_refresh.setStyleSheet("QPushButton{padding:9px 16px;border-radius:8px;background:#2563eb;color:#fff;border:none;}QPushButton:hover{background:#1d4ed8;}QPushButton:disabled{background:#bbb;}")
@@ -2202,8 +2395,11 @@ class MainWindow(QMainWindow):
             else:
                 self.lbl_today.setText("今日盈亏  —"); self.lbl_today.setStyleSheet("color:#999;")
 
+    def _open_export(self):
+        ExportDialog(self).exec()
+
     def _open_pnl(self):
-        d = PnlDialog(self); d.show(); d.start()
+        self._pnl_dialog = PnlDialog(self); self._pnl_dialog.show(); self._pnl_dialog.start()
 
     def _open_hold(self):
         price_map = {d["code"]: d.get("nav",0) for d in self.last_results if d.get("status")=="ok"}
