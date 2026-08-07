@@ -1,0 +1,32 @@
+# Python / 打包产物
+__pycache__/
+*.py[cod]
+build/
+dist/
+
+# 可执行文件(走Release分发,不入库)
+*.exe
+
+# 本地隐私数据(绝不上传)
+我的持仓.json
+trades.json
+自定义基金.json
+基金显示.json
+snapshots/
+screenshots/
+ocr_out.txt
+run.log
+我的基金.txt
+
+# v0.3 导出 Excel(默认存app目录,内含持仓/交易隐私数据)
+*.xlsx
+
+# 备份与一次性补丁
+*.bak*
+*.before_*
+patch_*.py
+
+# 本地工作目录(备份/归档/Release打包产物,不入库)
+备份/
+归档/
+release/
