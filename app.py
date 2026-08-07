@@ -67,7 +67,7 @@ NAME_MAP = {c: n for c, n in FUNDS}
 
 HOLD_FILE = "我的持仓.json"
 SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席=默认，不碰持仓账本
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -1317,6 +1317,8 @@ class HoldDialog(QDialog):
         tip.setStyleSheet("color:#555;background:#f7f9fc;border-radius:8px;padding:8px;"); lay.addWidget(tip)
         self.lbl_fix = QLabel(""); self.lbl_fix.setStyleSheet("color:#9a6b00;background:#fff7d6;border:1px solid #f0d97a;border-radius:8px;padding:6px 10px;")
         self.lbl_fix.setWordWrap(True); self.lbl_fix.hide(); lay.addWidget(self.lbl_fix)
+        self.lbl_x = QLabel(""); self.lbl_x.setStyleSheet("color:#1b5e20;background:#e8f5e9;border:1px solid #a5d6a7;border-radius:8px;padding:6px 10px;")
+        self.lbl_x.setWordWrap(True); self.lbl_x.hide(); lay.addWidget(self.lbl_x)
         raw_hold = load_holdings()
         self.table = QTableWidget(len(FUNDS),6)
         self.table.setHorizontalHeaderLabels(["基金名称","代码","持有份额","持仓成本价/每份","投入本金(元,可选)","买入日期(选填)"])
@@ -1344,7 +1346,11 @@ class HoldDialog(QDialog):
         b_paste = QPushButton("📋 粘贴填份额·成本"); b_paste.setToolTip("把支付宝/天天里『持有份额·持仓成本价』那段纯文本粘进来，一次灌进表。\n只填数字、不加新基金；新基金请先回首页『➕快速添加』。")
         b_paste.clicked.connect(self._paste_import)
         b_paste.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#fff3e0;color:#e65100;border:1px solid #ffcc80;}QPushButton:hover{background:#ffe0b2;}")
-        bar.addWidget(b_paste); bar.addStretch()
+        bar.addWidget(b_paste)
+        b_x = QPushButton("🔍 对账"); b_x.setToolTip("用交易流水逐笔回放，算出每只基金『应有』份额/本金，与手填值比对。\n差异行用橙底填入流水算出的值（待你核对），点保存才落盘；\n手填比流水多的基金会提示去补录流水。")
+        b_x.clicked.connect(self._cross_check)
+        b_x.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#e3f2fd;color:#1565c0;border:1px solid #90caf9;}QPushButton:hover{background:#bbdefb;}")
+        bar.addWidget(b_x); bar.addStretch()
         b_trade = QPushButton("📝 记一笔交易"); b_trade.clicked.connect(self._record_trade)
         b_trade.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#e8f5e9;color:#2e7d32;border:1px solid #a5d6a7;}QPushButton:hover{background:#c8e6c9;}")
         bar.addWidget(b_trade)
@@ -1378,6 +1384,48 @@ class HoldDialog(QDialog):
         finally:
             self._busy = False
 
+    def _cross_check(self):
+        trades = load_trades()
+        have = {t["code"] for t in trades}
+        if not have:
+            QMessageBox.information(self, "对账", "还没有交易流水。\n先在「📒 交易记录」补录，或导入支付宝交易截图的流水，再来对账。")
+            return
+        self.lbl_x.setText("⏳ 对账中：抓取历史净值…"); self.lbl_x.show()
+        QApplication.processEvents()
+        same = filled = 0; more_manual = []; failed = []
+        self._busy = True
+        try:
+            for r, (code, name) in enumerate(FUNDS):
+                if code not in have: continue
+                try:
+                    m = _fetch_hist_nav_map(code)
+                except Exception:
+                    failed.append(name); continue
+                d = replay_trades(code, m, trades)
+                cur_sh = self._num(r, 2)
+                diff = d["shares"] - cur_sh
+                tol = max(0.05, d["shares"] * 0.005, cur_sh * 0.005)
+                if abs(diff) <= tol:
+                    same += 1; continue
+                if d["shares"] > cur_sh:
+                    self.table.setItem(r, 2, QTableWidgetItem(self._fmt(d["shares"], 4)))
+                    if d["cost"] > 0: self.table.setItem(r, 3, QTableWidgetItem(self._fmt(d["cost"], 4)))
+                    if d["principal"] > 0: self.table.setItem(r, 4, QTableWidgetItem(self._fmt(d["principal"], 2)))
+                    for cc in (2, 3, 4):
+                        it = self.table.item(r, cc)
+                        if it: it.setBackground(IMP)
+                    filled += 1
+                else:
+                    more_manual.append(name)
+        finally:
+            self._busy = False
+        parts = [f"✅ 对账完成：{same} 只一致"]
+        if filled: parts.append(f"{filled} 只按流水校准（橙底待核对，点💾保存才落盘；流水估算与支付宝『确认份额』或有小误差，精确以支付宝为准）")
+        if more_manual: parts.append(f"⚠ 手填比流水多：{'、'.join(more_manual)}——可能流水有漏录，去「📒 交易记录」补录")
+        if failed: parts.append(f"⚠ 没抓到净值跳过：{'、'.join(failed)}")
+        self.lbl_x.setText("；".join(parts) + "。")
+        self.lbl_x.show()
+
     def _record_trade(self):
         rows = self.table.selectionModel().selectedRows()
         if not rows:
@@ -1405,10 +1453,37 @@ class HoldDialog(QDialog):
             cur["buy_date"] = base_bd
         draft = {code: cur}
         realized = [None]; cashflow = [None]
+        snap_to = None; to_code = None; src_sh = 0.0; conv_amt = 0.0; to_share = 0.0
+        if act == "convert":
+            src_sh = shares if shares > 0 else (amount / nav if nav > 0 else 0)
+            if src_sh <= 0:
+                QMessageBox.warning(self, "转换", "转换请填【份额】（转出份额），或填【金额】按 金额÷净值 反推。")
+                return
+            conv_amt = round(src_sh * nav, 2)
+            to_code = res.get("to_code"); to_share = res.get("to_share", 0)
+            if not to_code or to_code == code:
+                QMessageBox.warning(self, "转换", "请选择转入基金。")
+                return
+            try:
+                tm = _fetch_hist_nav_map(to_code)
+            except Exception:
+                tm = {}
+            to_nav = tm.get(date)
+            if (not to_nav) and to_share > 0:
+                to_nav = conv_amt / to_share
+            if not to_nav or to_nav <= 0:
+                QMessageBox.warning(self, "转换", f"没抓到转入基金 {date} 的净值，请直接填【转入份额】（支付宝交易详情里有）。")
+                return
+            if to_share <= 0: to_share = conv_amt / to_nav
         try:
-            snap = apply_trade(draft, code, act, nav=nav, amount=amount,
-                               shares=shares, date=date,
-                               realized_out=realized, cashflow_out=cashflow)
+            if act == "convert":
+                snap = apply_trade(draft, code, "convert", nav=nav, shares=src_sh, date=date,
+                                   realized_out=realized, cashflow_out=cashflow)
+                snap_to = apply_trade(draft, to_code, "buy", nav=to_nav, amount=conv_amt, date=date)
+            else:
+                snap = apply_trade(draft, code, act, nav=nav, amount=amount,
+                                   shares=shares, date=date,
+                                   realized_out=realized, cashflow_out=cashflow)
         except Exception as e:
             QMessageBox.warning(self, "记账失败", f"{e}")
             return
@@ -1419,8 +1494,21 @@ class HoldDialog(QDialog):
             self.table.setItem(r, 4, QTableWidgetItem(self._fmt(snap.get("principal", 0), 2)))
             bd = (snap.get("buy_date") or "").strip()
             self.table.setItem(r, 5, QTableWidgetItem(bd))
+            if snap_to is not None:
+                rr = next((i for i in range(self.table.rowCount())
+                           if self.table.item(i, 1) and self.table.item(i, 1).text().strip() == to_code), None)
+                if rr is not None:
+                    self.table.setItem(rr, 2, QTableWidgetItem(self._fmt(snap_to.get("shares", 0))))
+                    self.table.setItem(rr, 3, QTableWidgetItem(self._fmt(snap_to.get("cost", 0), 4)))
+                    self.table.setItem(rr, 4, QTableWidgetItem(self._fmt(snap_to.get("principal", 0), 2)))
         finally:
             self._busy = False
+        if act == "convert":
+            to_name = NAME_MAP.get(to_code, to_code)
+            QMessageBox.information(self, "已记入草稿",
+                f"✅ 转换已记入本窗草稿（尚未存盘）：{name} 转出 {src_sh:.4f} 份（≈{conv_amt:.2f}元）→ {to_name} 转入 {to_share:.4f} 份。\n"
+                f"⚠️ 点右下角『💾保存』才会写入文件；直接关窗＝放弃本笔。")
+            return
         extra = ""
         if realized[0] is not None: extra = f" 已实现盈亏 {realized[0]:+.4f}"
         if cashflow[0] is not None: extra = f" 现金流入 {cashflow[0]:+.2f}"
@@ -1510,6 +1598,16 @@ def _fetch_hist_nav_map(code):
     if len(code) != 6 or not code.isdigit():
         raise RuntimeError(f"基金代码无效:[{code}]")
 
+    # 优先全历史净值（lsjz 分页接口可能只返回最近一页，回放/对账会少算）
+    try:
+        _, hist, _ = fetch_history(code)
+        m = {datetime.fromtimestamp(ts/1000).strftime("%Y-%m-%d"): nv for ts, nv, _e in hist}
+    except Exception as e:
+        errs.append(f"全历史:{e}")
+    if m:
+        _HIST_CACHE[code] = m
+        return m
+
     try:
         for ps in (500, 20):
             txt = get(f"https://api.fund.eastmoney.com/f10/lsjz"
@@ -1566,8 +1664,9 @@ class TradeDialog(QDialog):
         H = QHBoxLayout()
         self.rb_buy = QRadioButton("买入")
         self.rb_sell = QRadioButton("卖出")
+        self.rb_conv = QRadioButton("转换")
         (self.rb_buy if kind == "buy" else self.rb_sell).setChecked(True)
-        H.addWidget(self.rb_buy); H.addWidget(self.rb_sell); H.addStretch()
+        H.addWidget(self.rb_buy); H.addWidget(self.rb_sell); H.addWidget(self.rb_conv); H.addStretch()
         L.addLayout(H)
 
         F = QFormLayout(); F.setLabelAlignment(Qt.AlignRight)
@@ -1586,6 +1685,18 @@ class TradeDialog(QDialog):
         if p0 > 0: self.ed_price.setText(f"{p0:.4f}")
         F.addRow("成交净值", self.ed_price)
         L.addLayout(F)
+
+        self.w_to = QWidget()
+        tf = QFormLayout(self.w_to); tf.setContentsMargins(0, 0, 0, 0); tf.setLabelAlignment(Qt.AlignRight)
+        self.cb_to = QComboBox()
+        for c, n in FUNDS:
+            if c != code: self.cb_to.addItem(f"{n}（{c}）", c)
+        self.ed_to_share = QLineEdit()
+        self.ed_to_share.setPlaceholderText("选填：不填按 转出金额÷转入净值 算")
+        tf.addRow("转入基金", self.cb_to); tf.addRow("转入份额", self.ed_to_share)
+        self.w_to.hide()
+        L.addWidget(self.w_to)
+        self.rb_conv.toggled.connect(self.w_to.setVisible)
 
         self.lbl_hint = QLabel("")
         self.lbl_hint.setWordWrap(True)
@@ -1661,12 +1772,17 @@ class TradeDialog(QDialog):
         self.accept()
 
     def result(self):
-        kind = "buy" if self.rb_buy.isChecked() else "sell"
+        kind = "convert" if self.rb_conv.isChecked() else ("buy" if self.rb_buy.isChecked() else "sell")
         date = self.ed_date.date().toString("yyyy-MM-dd")
         amount = float(self.ed_amt.text() or 0)
         share = float(self.ed_share.text() or 0)
         price = float(self.ed_price.text() or 0)
-        return {"kind": kind, "date": date, "amount": amount, "share": share, "price": price}
+        out = {"kind": kind, "date": date, "amount": amount, "share": share, "price": price}
+        if kind == "convert":
+            out["to_code"] = self.cb_to.currentData()
+            try: out["to_share"] = float(self.ed_to_share.text() or 0)
+            except ValueError: out["to_share"] = 0
+        return out
 
 TRADES_FILE = os.path.join(_BASE, "trades.json")
 
@@ -1678,9 +1794,45 @@ def load_trades():
 def save_trades(t):
     with open(TRADES_FILE, "w", encoding="utf-8") as f: json.dump(t, f, ensure_ascii=False, indent=1)
 
+def replay_trades(code, nav_map, trades):
+    """按流水逐笔回放，推导该只"应有"持仓三值(shares/cost/principal)。
+       规则与 apply_trade/收益时间线一致：buy 按 金额÷净值 加份额(有份额字段优先)并加本金；
+       sell/convert 按 份额(或金额÷净值) 减份额、本金按成本摊出；open 直接设份额；
+       dividend_reinvest 按 金额÷净值 加份额(不动本金)；dividend_cash 不动。"""
+    sh = cost = prin = 0.0
+    dds = sorted(nav_map)
+    for t in trades:
+        if t.get("code") != code: continue
+        ds = t.get("date", "")
+        nav = nav_map.get(ds)
+        if not nav:
+            cand = [d for d in dds if d <= ds]
+            nav = nav_map[cand[-1]] if cand else 0.0
+        if nav <= 0: continue
+        amt = float(t.get("amount") or 0); tsh = float(t.get("shares") or 0)
+        side = t.get("side")
+        if side == "buy":
+            add = tsh if tsh > 0 else amt / nav
+            if add <= 0: continue
+            sh += add; prin += (amt if amt > 0 else add * nav)
+            cost = prin / sh if sh else 0.0
+        elif side in ("sell", "convert"):
+            out = tsh if tsh > 0 else (amt / nav if amt else 0.0)
+            if out <= 0: continue
+            out = min(out, sh)
+            prin = max(prin - cost * out, 0.0); sh -= out
+            if sh <= 1e-9: sh = cost = prin = 0.0
+            else: cost = prin / sh
+        elif side == "open":
+            sh = tsh
+        elif side == "dividend_reinvest":
+            sh += amt / nav
+    return {"shares": sh, "cost": cost, "principal": prin}
+
 class PnlDialog(QDialog):
     """收益明细：收益总览 + 收益日历(红涨绿跌) + 当日明细。
-       口径：按当前份额回溯（未考虑历史加减仓），非交易日不显示。"""
+       口径：当日盈亏=Σ当日持有份额×(当日净值−前一日净值)；份额按交易记录逐日回溯；
+       起点=第一笔交易/最早买入日期(之前不记录)；休市日=0；清仓后=0。"""
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("📅 收益明细"); self.resize(900, 720)
@@ -1688,7 +1840,7 @@ class PnlDialog(QDialog):
         self._ym = (datetime.now().year, datetime.now().month)
         self._worker = None
         L = QVBoxLayout(self); L.setSpacing(8)
-        tip = QLabel("口径：当日盈亏 = Σ 当前份额 ×（当日净值 − 前一日净值）。按【当前份额】回溯，加减仓之前的月份仅供参考；灰格 = 非交易日/无数据。")
+        tip = QLabel("口径：当日盈亏 = Σ 当日持有份额 ×（当日净值 − 前一日净值），份额按交易记录逐日回溯。从第一笔交易/买入日期开始记录，之前不计；休市日收益为 0；全部卖出后为 0。无交易记录且未填买入日期的基金，从起点按当前份额近似（仅供参考）。")
         tip.setWordWrap(True); tip.setStyleSheet("color:#888;font-size:10px;"); L.addWidget(tip)
         ov = QFrame(); ov.setStyleSheet("QFrame{background:#f7f9fc;border-radius:10px;}")
         ol = QHBoxLayout(ov); ol.setContentsMargins(14,10,14,10)
@@ -1737,9 +1889,21 @@ class PnlDialog(QDialog):
         bb.addWidget(b); L.addLayout(bb)
 
     def start(self):
-        codes = [c for c, _n in FUNDS if c not in getattr(self.parent(), "_cleared_codes", set())]
+        trades_by = {}
+        for t in load_trades():
+            trades_by.setdefault(t["code"], []).append(t)
+        hold = load_holdings()
+        codes = []
+        for c, _n in FUNDS:
+            sh = float(self.parent().resolved.get(c, {}).get("shares") or 0)
+            bd = (hold.get(c) or {}).get("buy_date", "")
+            if trades_by.get(c) or sh > 0 or bd:
+                codes.append(c)
         if not codes:
             self.lbl_status.setText("⚠ 没有可统计的持仓基金。"); return
+        dates = [t.get("date", "") for ts in trades_by.values() for t in ts if t.get("date")]
+        dates += [(hold.get(c) or {}).get("buy_date", "") for c in codes if (hold.get(c) or {}).get("buy_date")]
+        self._start = min(dates) if dates else ""
         self._codes = codes
         self.lbl_status.setText(f"⏳ 抓取历史净值 0/{len(codes)} …")
         self._worker = PnlWorker(codes)
@@ -1766,7 +1930,10 @@ class PnlDialog(QDialog):
             self.lbl_status.setText("⚠ 没抓到任何历史净值。"); return
         self._ym = (int(self._days[-1][:4]), int(self._days[-1][5:7]))
         self._refresh_month(); self._update_overview()
-        self.lbl_status.setText(f"✅ 已加载 {len(out)}/{len(self._codes)} 只基金的历史净值。")
+        if self._start:
+            self.lbl_status.setText(f"✅ 已加载 {len(out)}/{len(self._codes)} 只基金的历史净值。收益自 {self._start} 起记录，之前不计。")
+        else:
+            self.lbl_status.setText(f"✅ 已加载 {len(out)}/{len(self._codes)} 只基金的历史净值。⚠ 无交易记录/买入日期，按当前份额回溯仅供参考，补录交易或填买入日期可修正。")
 
     def _build_timeline(self):
         """每只基金的份额时间线：有交易记录→按记录推；没有→用持仓buy_date+当前份额近似。
@@ -1800,6 +1967,7 @@ class PnlDialog(QDialog):
             if sh > 0 and bd: self._tl[code] = [(bd, sh)]
 
     def _shares_on(self, code, ds):
+        if getattr(self, "_start", "") and ds < self._start: return 0.0
         tl = self._tl.get(code)
         if not tl: return float(self.parent().resolved.get(code, {}).get("shares") or 0)
         sh = 0.0
@@ -1830,7 +1998,7 @@ class PnlDialog(QDialog):
         ym = last[:7]
         mp = sum(self._day_pnl(ds) for ds in self._days if ds[:7] == ym)
         base = 0.0
-        first = next((d for d in self._days if d[:7] == ym), None)
+        first = next((d for d in self._days if d[:7] == ym and d >= (self._start or d)), None)
         if first:
             for code in self._hist:
                 sh = self._shares_on(code, first); pv = self._pnav.get(code, {}).get(first)
@@ -1859,7 +2027,9 @@ class PnlDialog(QDialog):
         for d in range(1, ndays+1):
             ds = f"{y:04d}-{m:02d}-{d:02d}"; idx = first_wd + d - 1
             cell = self._cells[idx//7][idx%7]; cell.setProperty("ds", ds)
-            if ds in day_pnl and abs(day_pnl[ds]) > 1e-9:
+            if getattr(self, "_start", "") and ds < self._start:
+                cell.setText(f"{d}\n—"); cell.setStyleSheet("QLabel{background:#fafafa;border-radius:8px;color:#ccc;}")
+            elif ds in day_pnl and abs(day_pnl[ds]) > 1e-9:
                 v = day_pnl[ds]; a = min(abs(v)/vmax, 1.0)
                 bg = f"rgba(229,57,53,{0.10+0.55*a:.2f})" if v >= 0 else f"rgba(22,163,74,{0.10+0.55*a:.2f})"
                 cell.setText(f"{d}\n{v:+.2f}")
@@ -1942,9 +2112,11 @@ class TradesDialog(QDialog):
         ts = sorted(load_trades(), key=lambda t: t.get("date", ""))
         self.tbl.setRowCount(len(ts))
         for r, t in enumerate(ts):
+            side_txt = dict(self.SIDES).get(t.get("side"), t.get("side", ""))
+            if t.get("note") == "转换": side_txt = "转换·" + side_txt
             vals = [t.get("date", ""),
-                    NAME_MAP.get(t.get("code", ""), t.get("code", "")),
-                    dict(self.SIDES).get(t.get("side"), t.get("side", "")),
+                    NAME_MAP.get(t.get("code", "")) or t.get("name") or t.get("code", ""),
+                    side_txt,
                     str(t["amount"]) if t.get("amount") is not None else "",
                     str(t["shares"]) if t.get("shares") is not None else ""]
             for c, v in enumerate(vals):
@@ -2220,6 +2392,9 @@ class MainWindow(QMainWindow):
         self.lbl_fix.setWordWrap(True); self.lbl_fix.hide(); outer.addWidget(self.lbl_fix)
         self.lbl_alert = QLabel(""); self.lbl_alert.setStyleSheet("QLabel{color:#b3261e;background:#fdecea;border:1px solid #f5b7b1;border-radius:8px;padding:8px 12px;}")
         self.lbl_alert.setWordWrap(True); self.lbl_alert.hide(); outer.addWidget(self.lbl_alert)
+        self.lbl_empty = QLabel("👋 看板还是空的：在左上方『➕ 快速添加』输入 6 位基金代码，添加第一只基金后，这里就会变成你的持仓看板。")
+        self.lbl_empty.setStyleSheet("QLabel{color:#1565c0;background:#e3f2fd;border:1px solid #90caf9;border-radius:10px;padding:14px 16px;font-size:12px;}")
+        self.lbl_empty.setWordWrap(True); outer.addWidget(self.lbl_empty)
         split = QSplitter(Qt.Horizontal)
         left_scroll = QScrollArea(); left_scroll.setWidgetResizable(True); left_scroll.setMinimumWidth(380)
         left_scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
@@ -2269,6 +2444,7 @@ class MainWindow(QMainWindow):
             c.btn_clear.clicked.connect(lambda checked, cd=code: self._toggle_cleared(cd))
             if code in self._cleared_codes: c.set_cleared(True)
             self.cards_layout.insertWidget(self.cards_layout.count()-1,c); self.cards[code]=c
+        self._sync_empty_banner()
         return w
 
     def _toggle_cleared(self, code):
@@ -2298,10 +2474,12 @@ class MainWindow(QMainWindow):
             a = QPropertyAnimation(eff, b"opacity", c); a.setDuration(260); a.setStartValue(0.0); a.setEndValue(1.0)
             c._fade_anim = a; a.start(QAbstractAnimation.DeleteWhenStopped)
 
+    def _sync_empty_banner(self):
+        self.lbl_empty.setVisible(not FUNDS)
+
     def _refresh_home(self):
         if not FUNDS:
-            QMessageBox.information(self, "看板是空的",
-                "当前没有任何基金可抓。\n请在左上方『➕ 快速添加』输入6位代码添加第一只基金。")
+            self._sync_empty_banner()
             return
         self.btn_refresh.setEnabled(False); self.btn_refresh.setText("⏳  抓取中…")
         self.lbl_time.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -2438,6 +2616,7 @@ class MainWindow(QMainWindow):
         card.update_data(r, self.resolved)
         self.last_results.append(r)
         self._redraw_aggregates(); self._add_input.clear()
+        self._sync_empty_banner()
         QMessageBox.information(self,"已添加",
             f"✅ {name}（{code}）已加入看板并保存。\n\n该基金尚未填写持仓，暂不计入盈亏；\n在「💼 管理持仓」填写份额/成本后，盈亏统计才会包含它。")
 
@@ -2489,6 +2668,7 @@ class MainWindow(QMainWindow):
             if clear_hold:
                 h = load_holdings(); h.pop(c, None); save_holdings(h)
             self._redraw_aggregates(); rebuild()
+            self._sync_empty_banner()
         rebuild(); d.exec()
 
     def _show_diag(self):
