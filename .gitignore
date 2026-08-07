@@ -23,6 +23,7 @@ run.log
 
 # 备份与一次性补丁
 *.bak*
+*.tmp
 *.before_*
 patch_*.py
 
