@@ -39,24 +39,57 @@ os.chdir(_BASE)
 FUNDS = []   # 看板基金全部来自「自定义基金.json」；初始为空看板，用户经首页『快速添加』自行建立名单
 EXTRA_FILE = "自定义基金.json"
 
-def _load_extra():
+def _atomic_write_json(path, obj, **kw):
+    """统一写盘防烂：先备 .bak，再写同目录临时文件并 os.replace 原子替换，
+       中断/崩溃不会留下半截 json（v0.5 推广到全部数据文件）。"""
     try:
-        with open(EXTRA_FILE, "r", encoding="utf-8") as f:
-            arr = json.load(f)
-        out = []; seen = set()
-        for it in arr:
-            if not isinstance(it, dict): continue
-            c = str(it.get("code", "")).strip(); n = str(it.get("name", "")).strip()
-            if re.search(r"^\d{6}$", c) and n and c not in seen:
-                out.append({"code": c, "name": n}); seen.add(c)
-        return out
+        if os.path.exists(path):
+            shutil.copy2(path, path + ".bak")
     except Exception:
-        return []
+        pass
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                               dir=os.path.dirname(os.path.abspath(path)) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, **kw)
+        os.replace(tmp, path)
+    except Exception:
+        try: os.remove(tmp)
+        except Exception: pass
+        raise
+
+def _load_json_with_bak(path, default):
+    """读 json；主文件损坏时回退 .bak 并把 .bak 恢复为主文件；都不行返回 default。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception:
+        pass
+    try:
+        with open(path + ".bak", "r", encoding="utf-8") as f:
+            data = json.load(f)
+        try: shutil.copy2(path + ".bak", path)
+        except Exception: pass
+        return data
+    except Exception:
+        return default
+
+def _load_extra():
+    arr = _load_json_with_bak(EXTRA_FILE, [])
+    if not isinstance(arr, list): arr = []
+    out = []; seen = set()
+    for it in arr:
+        if not isinstance(it, dict): continue
+        c = str(it.get("code", "")).strip(); n = str(it.get("name", "")).strip()
+        if re.search(r"^\d{6}$", c) and n and c not in seen:
+            out.append({"code": c, "name": n}); seen.add(c)
+    return out
 
 def _save_extra(arr):
     try:
-        with open(EXTRA_FILE, "w", encoding="utf-8") as f:
-            json.dump(arr, f, ensure_ascii=False, indent=2)
+        _atomic_write_json(EXTRA_FILE, arr, indent=2)
     except Exception:
         pass
 
@@ -67,7 +100,7 @@ NAME_MAP = {c: n for c, n in FUNDS}
 
 HOLD_FILE = "我的持仓.json"
 SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席=默认，不碰持仓账本
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -104,26 +137,19 @@ _HEADERS_IDX = {
 
 
 def load_holdings():
-    try:
-        with open(HOLD_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    d = _load_json_with_bak(HOLD_FILE, {})
+    return d if isinstance(d, dict) else {}
 
 
 def load_show_state():
-    try:
-        with open(SHOW_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        return set(str(c).strip() for c in (d.get("cleared") or []))
-    except Exception:
-        return set()
+    d = _load_json_with_bak(SHOW_FILE, {})
+    if not isinstance(d, dict): return set()
+    return set(str(c).strip() for c in (d.get("cleared") or []))
 
 
 def save_show_state(cleared):
     try:
-        with open(SHOW_FILE, "w", encoding="utf-8") as f:
-            json.dump({"cleared": sorted(cleared)}, f, ensure_ascii=False, indent=2)
+        _atomic_write_json(SHOW_FILE, {"cleared": sorted(cleared)}, indent=2)
     except Exception:
         pass
 
@@ -140,26 +166,8 @@ def _round_rec(rec):
 
 
 def save_holdings(d):
-    # 写前自动备份(只在原文件存在时备)
-    try:
-        if os.path.exists(HOLD_FILE):
-            shutil.copy2(HOLD_FILE, HOLD_FILE + ".bak")
-    except Exception:
-        pass
-    # 落库前 round 收尾
-    d2 = {k: _round_rec(v) for k, v in d.items()}
-    # 写入策略：先写同目录临时文件，再 os.replace 替换，避免中断导致 json 损坏
-    base = os.path.basename(HOLD_FILE)
-    fd, tmp = tempfile.mkstemp(prefix=base + ".", suffix=".tmp",
-                               dir=os.path.dirname(os.path.abspath(HOLD_FILE)) or ".")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(d2, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, HOLD_FILE)
-    except Exception:
-        try: os.remove(tmp)
-        except Exception: pass
-        raise
+    d2 = {k: _round_rec(v) for k, v in d.items()}   # 落库前 round 收尾
+    _atomic_write_json(HOLD_FILE, d2, indent=2)
 
 
 def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
@@ -1787,12 +1795,11 @@ class TradeDialog(QDialog):
 TRADES_FILE = os.path.join(_BASE, "trades.json")
 
 def load_trades():
-    try:
-        with open(TRADES_FILE, encoding="utf-8") as f: return json.load(f)
-    except Exception: return []
+    d = _load_json_with_bak(TRADES_FILE, [])
+    return d if isinstance(d, list) else []
 
 def save_trades(t):
-    with open(TRADES_FILE, "w", encoding="utf-8") as f: json.dump(t, f, ensure_ascii=False, indent=1)
+    _atomic_write_json(TRADES_FILE, t, indent=1)
 
 def replay_trades(code, nav_map, trades):
     """按流水逐笔回放，推导该只"应有"持仓三值(shares/cost/principal)。
