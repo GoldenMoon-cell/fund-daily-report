@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QDialog, QStackedWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QButtonGroup, QGraphicsOpacityEffect,
     QComboBox, QLineEdit, QFileDialog, QSplitter, QCheckBox,
-    QRadioButton, QFormLayout, QDateEdit, QGridLayout,
+    QRadioButton, QFormLayout, QDateEdit, QGridLayout, QInputDialog,
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, QTimer, QPropertyAnimation, QAbstractAnimation, QDate,
@@ -100,7 +100,9 @@ NAME_MAP = {c: n for c, n in FUNDS}
 
 HOLD_FILE = "我的持仓.json"
 SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席=默认，不碰持仓账本
-APP_VERSION = "0.5.0"
+ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
+DEFAULT_ACCOUNT = "默认"
+APP_VERSION = "0.6.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -136,9 +138,82 @@ _HEADERS_IDX = {
 }
 
 
+def load_accounts():
+    arr = _load_json_with_bak(ACCOUNTS_FILE, None)
+    if isinstance(arr, list) and arr:
+        return [a for a in (x.get("name", "").strip() if isinstance(x, dict) else str(x).strip() for x in arr) if a]
+    return [DEFAULT_ACCOUNT]
+
+def save_accounts(names):
+    _atomic_write_json(ACCOUNTS_FILE, [{"name": n} for n in names], indent=2)
+
+def _migrate_holdings_if_needed(d):
+    """v0.5→v0.6：旧扁平格式 {code: rec} → 新嵌套格式 {"默认": {code: rec}}。"""
+    if not d:
+        return d
+    for k, v in d.items():
+        if isinstance(v, dict) and re.search(r'^\d{6}$', k.strip()):
+            migrated = {DEFAULT_ACCOUNT: d}
+            save_holdings_nested(migrated)
+            return migrated
+    return d
+
 def load_holdings():
+    """读取全部持仓并合并为 {code: rec}（跨账户汇总），兼容 v0.5 旧格式。"""
     d = _load_json_with_bak(HOLD_FILE, {})
-    return d if isinstance(d, dict) else {}
+    if not isinstance(d, dict): return {}
+    d = _migrate_holdings_if_needed(d)
+    return merge_holdings(d)
+
+def load_holdings_nested():
+    d = _load_json_with_bak(HOLD_FILE, {})
+    if not isinstance(d, dict): return {}
+    return _migrate_holdings_if_needed(d)
+
+def load_holdings_for_account(account):
+    nested = load_holdings_nested()
+    h = nested.get(account, {})
+    return h if isinstance(h, dict) else {}
+
+def merge_holdings(nested):
+    """合并所有账户持仓 → {code: {shares, cost, principal, buy_date}}。"""
+    out = {}
+    for acc_name, holdings in nested.items():
+        if not isinstance(holdings, dict): continue
+        for code, rec in holdings.items():
+            if not isinstance(rec, dict): continue
+            sh = float(rec.get("shares") or 0)
+            prin = float(rec.get("principal") or 0)
+            bd = (rec.get("buy_date") or "").strip()
+            if code not in out:
+                out[code] = {"shares": sh, "principal": prin, "buy_date": bd}
+            else:
+                out[code]["shares"] += sh
+                out[code]["principal"] += prin
+                if bd and (not out[code]["buy_date"] or bd < out[code]["buy_date"]):
+                    out[code]["buy_date"] = bd
+    for code, rec in out.items():
+        sh, prin = rec["shares"], rec["principal"]
+        rec["cost"] = round(prin / sh, 4) if sh > 0 else 0.0
+    return out
+
+def save_holdings_nested(nested):
+    """保存嵌套格式 {account: {code: rec}}。"""
+    out = {}
+    for acc, holdings in nested.items():
+        if isinstance(holdings, dict):
+            out[acc] = {k: _round_rec(v) for k, v in holdings.items()}
+        else:
+            out[acc] = holdings
+    _atomic_write_json(HOLD_FILE, out, indent=2)
+
+def _remove_code_from_all_accounts(code):
+    """从所有账户中删除某只基金的持仓记录。"""
+    nested = load_holdings_nested()
+    for acc in list(nested):
+        if isinstance(nested[acc], dict):
+            nested[acc].pop(code, None)
+    save_holdings_nested(nested)
 
 
 def load_show_state():
@@ -165,17 +240,13 @@ def _round_rec(rec):
     return out
 
 
-def save_holdings(d):
-    d2 = {k: _round_rec(v) for k, v in d.items()}   # 落库前 round 收尾
-    _atomic_write_json(HOLD_FILE, d2, indent=2)
-
-
 def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
-                date=None, realized_out=None, cashflow_out=None):
+                date=None, realized_out=None, cashflow_out=None, account=DEFAULT_ACCOUNT):
     """在 holdings(完整dict) 上原地记一笔。返回该只最新快照 dict。
-       约定：调用方必须先 d=load_holdings() 读全，改完 save_holdings(d) 写全，
-       不可拿单只 dict 去 save_holdings，否则覆盖其余基金。
+       约定：调用方必须先 d=load_holdings_for_account(acc) 读全，改完 save_holdings_nested 写全，
+       不可拿单只 dict 去保存，否则覆盖其余基金。
        action ∈ {buy, sell, dividend_reinvest, dividend_cash, convert}。
+       account 参数指定该笔交易属于哪个账户。
     """
     h = holdings.setdefault(code, {"shares": 0.0, "cost": 0.0, "principal": 0.0})
     sh = float(h.get("shares", 0) or 0)
@@ -235,10 +306,11 @@ def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
     if _rec is not None:
         _rec["date"] = (date or datetime.now().strftime("%Y-%m-%d"))
         _rec["code"] = code
+        _rec["account"] = account
         _all = load_trades()
         if not any(t.get("code") == code and t.get("side") == "open" for t in _all):
             _all.append({"date": (h.get("buy_date") or _rec["date"]), "code": code,
-                         "side": "open", "shares": round(sh, 4)})
+                         "side": "open", "shares": round(sh, 4), "account": account})
         _all.append(_rec)
         save_trades(_all)
     return h
@@ -1312,10 +1384,28 @@ class PasteDialog(QDialog):
 
 
 class HoldDialog(QDialog):
-    def __init__(self, resolved, corrected_codes, price_map, parent=None):
+    def __init__(self, resolved, corrected_codes, price_map, parent=None, account=None):
         super().__init__(parent); self.setWindowTitle("💼 管理我的持仓"); self.resize(760,560)
         self._price = price_map; self._busy = True
+        self._accounts = load_accounts()
+        self._current_account = account or (self._accounts[0] if self._accounts else DEFAULT_ACCOUNT)
         lay = QVBoxLayout(self)
+        # —— 账户选择器 ——
+        acc_bar = QHBoxLayout()
+        acc_bar.addWidget(QLabel("账户："))
+        self._acc_combo = QComboBox()
+        for a in self._accounts:
+            self._acc_combo.addItem(a)
+        idx = self._acc_combo.findText(self._current_account)
+        if idx >= 0: self._acc_combo.setCurrentIndex(idx)
+        self._acc_combo.currentTextChanged.connect(self._switch_account)
+        acc_bar.addWidget(self._acc_combo)
+        self._btn_manage_acc = QPushButton("⚙ 管理账户")
+        self._btn_manage_acc.setStyleSheet("QPushButton{padding:4px 10px;border-radius:6px;background:#f0f0f0;border:none;}QPushButton:hover{background:#e3e3e3;}")
+        self._btn_manage_acc.clicked.connect(self._manage_accounts)
+        acc_bar.addWidget(self._btn_manage_acc)
+        acc_bar.addStretch()
+        lay.addLayout(acc_bar)
         tip = QLabel("  • 「持仓成本价/每份」填每份成本的小数（如 1.0000），不要填持有金额。\n"
                      "  • 「投入本金」列可选：留空即可；要填就填≈份额×成本价(如1000×1.2000≈1200.00)，\n"
                      "    不要填『持有金额/市值』（那是市值=本金+收益，不是本金）。\n"
@@ -1327,7 +1417,7 @@ class HoldDialog(QDialog):
         self.lbl_fix.setWordWrap(True); self.lbl_fix.hide(); lay.addWidget(self.lbl_fix)
         self.lbl_x = QLabel(""); self.lbl_x.setStyleSheet("color:#1b5e20;background:#e8f5e9;border:1px solid #a5d6a7;border-radius:8px;padding:6px 10px;")
         self.lbl_x.setWordWrap(True); self.lbl_x.hide(); lay.addWidget(self.lbl_x)
-        raw_hold = load_holdings()
+        raw_hold = load_holdings_for_account(self._current_account)
         self.table = QTableWidget(len(FUNDS),6)
         self.table.setHorizontalHeaderLabels(["基金名称","代码","持有份额","持仓成本价/每份","投入本金(元,可选)","买入日期(选填)"])
         self.table.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch)
@@ -1409,7 +1499,7 @@ class HoldDialog(QDialog):
                     m = _fetch_hist_nav_map(code)
                 except Exception:
                     failed.append(name); continue
-                d = replay_trades(code, m, trades)
+                d = replay_trades(code, m, trades, self._current_account)
                 cur_sh = self._num(r, 2)
                 diff = d["shares"] - cur_sh
                 tol = max(0.05, d["shares"] * 0.005, cur_sh * 0.005)
@@ -1447,11 +1537,15 @@ class HoldDialog(QDialog):
         code = self.table.item(r, 1).text().strip()
         name = self.table.item(r, 0).text().strip()
         dlg = TradeDialog(self, name, code, "buy")
+        # 预设当前账户
+        idx = dlg.cb_account.findText(self._current_account)
+        if idx >= 0: dlg.cb_account.setCurrentIndex(idx)
         if dlg.exec() != QDialog.Accepted or not dlg.result:
             return
         res = dlg.result()
         act, nav = res["kind"], res["price"]
         amount, shares, date = res["amount"], res["share"], res["date"]
+        trade_account = res.get("account", self._current_account)
         base_sh   = self._num(r, 2)
         base_cost = self._num(r, 3)
         base_prin = self._num(r, 4)
@@ -1486,12 +1580,13 @@ class HoldDialog(QDialog):
         try:
             if act == "convert":
                 snap = apply_trade(draft, code, "convert", nav=nav, shares=src_sh, date=date,
-                                   realized_out=realized, cashflow_out=cashflow)
-                snap_to = apply_trade(draft, to_code, "buy", nav=to_nav, amount=conv_amt, date=date)
+                                   realized_out=realized, cashflow_out=cashflow, account=trade_account)
+                snap_to = apply_trade(draft, to_code, "buy", nav=to_nav, amount=conv_amt, date=date,
+                                      account=trade_account)
             else:
                 snap = apply_trade(draft, code, act, nav=nav, amount=amount,
                                    shares=shares, date=date,
-                                   realized_out=realized, cashflow_out=cashflow)
+                                   realized_out=realized, cashflow_out=cashflow, account=trade_account)
         except Exception as e:
             QMessageBox.warning(self, "记账失败", f"{e}")
             return
@@ -1557,6 +1652,121 @@ class HoldDialog(QDialog):
             self.table.setItem(r,2,QTableWidgetItem("")); self.table.setItem(r,3,QTableWidgetItem("")); self.table.setItem(r,4,QTableWidgetItem("")); self.table.setItem(r,5,QTableWidgetItem(""))
         self._busy = False
 
+    def _switch_account(self, name):
+        if self._busy or not name:
+            return
+        self._busy = True
+        try:
+            self._current_account = name
+            self._load_for_account()
+        finally:
+            self._busy = False
+
+    def _load_for_account(self):
+        """根据当前账户重新加载表格数据。"""
+        holdings = load_holdings_for_account(self._current_account)
+        price_map = self._price
+        resolved, corrected = resolve_holdings(holdings, price_map)
+        self._busy = True
+        try:
+            for r, (code, name) in enumerate(FUNDS):
+                r2 = resolved.get(code, {})
+                sh = r2.get("shares", ""); cost = r2.get("cost", ""); prin = r2.get("principal", "")
+                bd = holdings.get(code, {}).get("buy_date", "") or ""
+                self.table.setItem(r,2,QTableWidgetItem(self._fmt(sh)))
+                self.table.setItem(r,3,QTableWidgetItem(self._fmt(cost,4)))
+                self.table.setItem(r,4,QTableWidgetItem(self._fmt(prin,2)))
+                self.table.setItem(r,5,QTableWidgetItem(bd.strip()))
+                for cc in range(6):
+                    it = self.table.item(r,cc)
+                    if it:
+                        it.setBackground(HL if code in corrected else QColor(255,255,255,0))
+        finally:
+            self._busy = False
+
+    def _manage_accounts(self):
+        dlg = QDialog(self); dlg.setWindowTitle("管理账户"); dlg.resize(400, 300)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("每个账户对应一个平台（如支付宝、天天基金、招行等）。"))
+        list_box = QVBoxLayout(); lay.addLayout(list_box)
+        def rebuild():
+            while list_box.count():
+                it = list_box.takeAt(0); w = it.widget()
+                if w: w.deleteLater()
+            for a in load_accounts():
+                row = QHBoxLayout()
+                lb = QLabel(a); lb.setFont(QFont("Microsoft YaHei", 10))
+                row.addWidget(lb, 1)
+                if a != DEFAULT_ACCOUNT:
+                    btn_rename = QPushButton("改名")
+                    btn_rename.clicked.connect(lambda _, x=a: do_rename(x))
+                    btn_del = QPushButton("删除")
+                    btn_del.setStyleSheet("color:#b3261e;")
+                    btn_del.clicked.connect(lambda _, x=a: do_delete(x))
+                    row.addWidget(btn_rename); row.addWidget(btn_del)
+                list_box.addLayout(row)
+        def do_rename(old):
+            new, ok = QInputDialog.getText(dlg, "改名", "新账户名：", text=old)
+            if not ok or not new.strip() or new.strip() == old:
+                return
+            new = new.strip()
+            if new in load_accounts():
+                QMessageBox.warning(dlg, "重复", f"账户「{new}」已存在。"); return
+            accs = load_accounts()
+            accs[accs.index(old)] = new
+            save_accounts(accs)
+            nested = load_holdings_nested()
+            if old in nested:
+                nested[new] = nested.pop(old)
+                save_holdings_nested(nested)
+            all_t = load_trades()
+            for t in all_t:
+                if t.get("account") == old:
+                    t["account"] = new
+            save_trades(all_t)
+            self._current_account = new
+            rebuild()
+        def do_delete(name):
+            h = load_holdings_for_account(name)
+            has_data = any((v.get("shares") or 0) > 0 or (v.get("principal") or 0) > 0 for v in h.values() if isinstance(v, dict))
+            if has_data:
+                QMessageBox.warning(dlg, "无法删除", f"账户「{name}」还有持仓数据，请先清空。"); return
+            if QMessageBox.question(dlg, "删除账户", f"确定删除账户「{name}」？") != QMessageBox.Yes:
+                return
+            accs = load_accounts(); accs.remove(name); save_accounts(accs)
+            nested = load_holdings_nested(); nested.pop(name, None); save_holdings_nested(nested)
+            rebuild()
+        add_bar = QHBoxLayout()
+        ed_new = QLineEdit(); ed_new.setPlaceholderText("新账户名称")
+        btn_add = QPushButton("➕ 添加")
+        def do_add():
+            n = ed_new.text().strip()
+            if not n: return
+            if n in load_accounts():
+                QMessageBox.warning(dlg, "重复", f"账户「{n}」已存在。"); return
+            accs = load_accounts(); accs.append(n); save_accounts(accs)
+            ed_new.clear(); rebuild()
+        btn_add.clicked.connect(do_add)
+        add_bar.addWidget(ed_new, 1); add_bar.addWidget(btn_add)
+        lay.addLayout(add_bar)
+        btn_close = QPushButton("关闭"); btn_close.clicked.connect(dlg.accept)
+        lay.addWidget(btn_close)
+        rebuild()
+        dlg.exec()
+        self._accounts = load_accounts()
+        self._acc_combo.blockSignals(True)
+        self._acc_combo.clear()
+        for a in self._accounts:
+            self._acc_combo.addItem(a)
+        idx = self._acc_combo.findText(self._current_account)
+        if idx >= 0:
+            self._acc_combo.setCurrentIndex(idx)
+        else:
+            self._current_account = self._accounts[0] if self._accounts else DEFAULT_ACCOUNT
+            self._acc_combo.setCurrentIndex(0)
+        self._acc_combo.blockSignals(False)
+        self._load_for_account()
+
     def _save(self):
         d = {}
         for r,(code,name) in enumerate(FUNDS):
@@ -1580,7 +1790,9 @@ class HoldDialog(QDialog):
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                 if ans != QMessageBox.Yes: return
             d[code] = {"shares": sh, "cost": round(cost,4), "principal": round(prin,2), "buy_date": bd}
-        save_holdings(d)
+        nested = load_holdings_nested()
+        nested[self._current_account] = d
+        save_holdings_nested(nested)
         self.saved = True
         self.accept()
 
@@ -1678,6 +1890,10 @@ class TradeDialog(QDialog):
         L.addLayout(H)
 
         F = QFormLayout(); F.setLabelAlignment(Qt.AlignRight)
+        self.cb_account = QComboBox()
+        for a in load_accounts():
+            self.cb_account.addItem(a)
+        F.addRow("账户", self.cb_account)
         self.ed_date = QDateEdit(QDate.currentDate())
         self.ed_date.setCalendarPopup(True)
         self.ed_date.setDisplayFormat("yyyy-MM-dd")
@@ -1785,7 +2001,8 @@ class TradeDialog(QDialog):
         amount = float(self.ed_amt.text() or 0)
         share = float(self.ed_share.text() or 0)
         price = float(self.ed_price.text() or 0)
-        out = {"kind": kind, "date": date, "amount": amount, "share": share, "price": price}
+        account = self.cb_account.currentText() or DEFAULT_ACCOUNT
+        out = {"kind": kind, "date": date, "amount": amount, "share": share, "price": price, "account": account}
         if kind == "convert":
             out["to_code"] = self.cb_to.currentData()
             try: out["to_share"] = float(self.ed_to_share.text() or 0)
@@ -1801,15 +2018,14 @@ def load_trades():
 def save_trades(t):
     _atomic_write_json(TRADES_FILE, t, indent=1)
 
-def replay_trades(code, nav_map, trades):
-    """按流水逐笔回放，推导该只"应有"持仓三值(shares/cost/principal)。
-       规则与 apply_trade/收益时间线一致：buy 按 金额÷净值 加份额(有份额字段优先)并加本金；
-       sell/convert 按 份额(或金额÷净值) 减份额、本金按成本摊出；open 直接设份额；
-       dividend_reinvest 按 金额÷净值 加份额(不动本金)；dividend_cash 不动。"""
+def replay_trades(code, nav_map, trades, account=None):
+    """按流水逐笔回放，推导该只“应有”持仓三值(shares/cost/principal)。
+       account=None 表示不过滤账户（合并回放）。"""
     sh = cost = prin = 0.0
     dds = sorted(nav_map)
     for t in trades:
         if t.get("code") != code: continue
+        if account is not None and (t.get("account") or DEFAULT_ACCOUNT) != account: continue
         ds = t.get("date", "")
         nav = nav_map.get(ds)
         if not nav:
@@ -1845,10 +2061,21 @@ class PnlDialog(QDialog):
         self.setWindowTitle("📅 收益明细"); self.resize(900, 720)
         self._hist = {}; self._days = []; self._sel = None
         self._ym = (datetime.now().year, datetime.now().month)
-        self._worker = None
+        self._worker = None; self._account_filter = "__all__"
         L = QVBoxLayout(self); L.setSpacing(8)
         tip = QLabel("口径：当日盈亏 = Σ 当日持有份额 ×（当日净值 − 前一日净值），份额按交易记录逐日回溯。从第一笔交易/买入日期开始记录，之前不计；休市日收益为 0；全部卖出后为 0。无交易记录且未填买入日期的基金，从起点按当前份额近似（仅供参考）。")
         tip.setWordWrap(True); tip.setStyleSheet("color:#888;font-size:10px;"); L.addWidget(tip)
+        # 账户筛选
+        acc_bar = QHBoxLayout()
+        acc_bar.addWidget(QLabel("账户筛选："))
+        self._acc_filter = QComboBox()
+        self._acc_filter.addItem("全部账户", "__all__")
+        for a in load_accounts():
+            self._acc_filter.addItem(a, a)
+        self._acc_filter.currentIndexChanged.connect(self._on_filter_changed)
+        acc_bar.addWidget(self._acc_filter)
+        acc_bar.addStretch()
+        L.addLayout(acc_bar)
         ov = QFrame(); ov.setStyleSheet("QFrame{background:#f7f9fc;border-radius:10px;}")
         ol = QHBoxLayout(ov); ol.setContentsMargins(14,10,14,10)
         self._ov_lbls = {}
@@ -1896,8 +2123,13 @@ class PnlDialog(QDialog):
         bb.addWidget(b); L.addLayout(bb)
 
     def start(self):
+        all_trades = load_trades()
+        if self._account_filter != "__all__":
+            filtered = [t for t in all_trades if (t.get("account") or DEFAULT_ACCOUNT) == self._account_filter]
+        else:
+            filtered = all_trades
         trades_by = {}
-        for t in load_trades():
+        for t in filtered:
             trades_by.setdefault(t["code"], []).append(t)
         hold = load_holdings()
         codes = []
@@ -1942,12 +2174,21 @@ class PnlDialog(QDialog):
         else:
             self.lbl_status.setText(f"✅ 已加载 {len(out)}/{len(self._codes)} 只基金的历史净值。⚠ 无交易记录/买入日期，按当前份额回溯仅供参考，补录交易或填买入日期可修正。")
 
+    def _on_filter_changed(self):
+        self._account_filter = self._acc_filter.currentData()
+        if self._hist:
+            self._build_timeline()
+            self._refresh_month(); self._update_overview()
+
     def _build_timeline(self):
         """每只基金的份额时间线：有交易记录→按记录推；没有→用持仓buy_date+当前份额近似。
            注意：trades.json 里 side 存的是英文 buy/sell/open（见 apply_trade）。"""
         self._tl = {}
+        all_trades = load_trades()
+        if self._account_filter != "__all__":
+            all_trades = [t for t in all_trades if (t.get("account") or DEFAULT_ACCOUNT) == self._account_filter]
         trades = {}
-        for t in load_trades():
+        for t in all_trades:
             trades.setdefault(t["code"], []).append(t)
         for code in self._hist:
             m = self._hist[code]; dds = sorted(m)
@@ -2085,8 +2326,8 @@ class TradesDialog(QDialog):
         root = QVBoxLayout(self)
         root.addWidget(QLabel("补录＝把支付宝里过去的交易抄进来，只影响收益日历，不影响当前持仓。份额必填（照抄支付宝「确认份额」），金额选填。"))
 
-        self.tbl = QTableWidget(0, 5)
-        self.tbl.setHorizontalHeaderLabels(["日期", "基金", "类型", "金额(元)", "份额"])
+        self.tbl = QTableWidget(0, 6)
+        self.tbl.setHorizontalHeaderLabels(["日期", "基金", "类型", "金额(元)", "份额", "账户"])
         self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -2101,11 +2342,14 @@ class TradesDialog(QDialog):
         self.d_side = QComboBox()
         for k, v in self.SIDES:
             self.d_side.addItem(v, k)
+        self.d_account = QComboBox()
+        for a in load_accounts():
+            self.d_account.addItem(a)
         self.d_shares = QLineEdit(); self.d_shares.setPlaceholderText("必填：支付宝里的确认份额")
         self.d_amount = QLineEdit(); self.d_amount.setPlaceholderText("选填：金额(元)")
         form.addRow("日期", self.d_date);  form.addRow("基金", self.d_code)
-        form.addRow("类型", self.d_side);  form.addRow("份额", self.d_shares)
-        form.addRow("金额", self.d_amount)
+        form.addRow("类型", self.d_side);  form.addRow("账户", self.d_account)
+        form.addRow("份额", self.d_shares); form.addRow("金额", self.d_amount)
         root.addLayout(form)
 
         bar = QHBoxLayout()
@@ -2125,7 +2369,8 @@ class TradesDialog(QDialog):
                     NAME_MAP.get(t.get("code", "")) or t.get("name") or t.get("code", ""),
                     side_txt,
                     str(t["amount"]) if t.get("amount") is not None else "",
-                    str(t["shares"]) if t.get("shares") is not None else ""]
+                    str(t["shares"]) if t.get("shares") is not None else "",
+                    t.get("account") or DEFAULT_ACCOUNT]
             for c, v in enumerate(vals):
                 self.tbl.setItem(r, c, QTableWidgetItem(v))
 
@@ -2135,7 +2380,7 @@ class TradesDialog(QDialog):
         shs = self.d_shares.text().strip(); amt = self.d_amount.text().strip()
         if side != "dividend_cash" and not shs:
             QMessageBox.warning(self, "提示", "请先填份额（现金分红除外）。"); return
-        rec = {"date": date, "code": code, "side": side}
+        rec = {"date": date, "code": code, "side": side, "account": self.d_account.currentText() or DEFAULT_ACCOUNT}
         if shs: rec["shares"] = float(shs)
         if amt: rec["amount"] = round(float(amt), 2)
         all_t = load_trades(); all_t.append(rec); save_trades(all_t)
@@ -2186,16 +2431,21 @@ def _write_xlsx(path, sections, parent):
     for key, title in sections:
         ws = wb.create_sheet(title=title[:31])  # sheet 名 <=31 字符
         if key == "holdings":
-            d = load_holdings()
-            if not d:
+            nested = load_holdings_nested()
+            if not nested or all(not v for v in nested.values()):
                 write_empty(ws, "暂无持仓记录（在「💼 管理持仓」填写后导出）")
                 continue
             rows = []
-            for code in sorted(d):
-                r = d[code]; sh = r.get("shares", 0); cost = r.get("cost", 0)
-                prin = r.get("principal", 0); bd = r.get("buy_date", "")
-                rows.append([code, sh, cost, prin if prin is not None else "", bd])
-            style_sheet(ws, ["基金代码", "份额", "每份成本", "本金", "买入日期"], rows)
+            for acc in sorted(nested):
+                holdings = nested[acc]
+                if not isinstance(holdings, dict): continue
+                for code in sorted(holdings):
+                    r = holdings[code]
+                    if not isinstance(r, dict): continue
+                    sh = r.get("shares", 0); cost = r.get("cost", 0)
+                    prin = r.get("principal", 0); bd = r.get("buy_date", "")
+                    rows.append([acc, code, sh, cost, prin if prin is not None else "", bd])
+            style_sheet(ws, ["账户", "基金代码", "份额", "每份成本", "本金", "买入日期"], rows)
         elif key == "trades":
             t = load_trades()
             if not t:
@@ -2207,8 +2457,9 @@ def _write_xlsx(path, sections, parent):
             for it in sorted(t, key=lambda x: x.get("date", "")):
                 rows.append([it.get("date", ""), it.get("code", ""),
                              side_map.get(it.get("side", ""), it.get("side", "")),
-                             it.get("amount", ""), it.get("shares", "")])
-            style_sheet(ws, ["日期", "基金代码", "类型", "金额", "份额"], rows)
+                             it.get("amount", ""), it.get("shares", ""),
+                             it.get("account") or DEFAULT_ACCOUNT])
+            style_sheet(ws, ["日期", "基金代码", "类型", "金额", "份额", "账户"], rows)
         elif key == "pnl":
             pnl = getattr(parent, "_pnl_dialog", None)
             hist = getattr(pnl, "_hist", None) if pnl else None
@@ -2369,6 +2620,13 @@ class MainWindow(QMainWindow):
         ver = QLabel(f"v{APP_VERSION}"); ver.setFont(QFont("Microsoft YaHei", 9)); ver.setStyleSheet("color:#999;")
         top.addWidget(ver)
         self.lbl_time = QLabel(""); self.lbl_time.setStyleSheet("color:#999;"); top.addWidget(self.lbl_time)
+        top.addWidget(QLabel("账户:"))
+        self._account_combo = QComboBox()
+        self._account_combo.addItem("全部账户", "__all__")
+        for _a in load_accounts():
+            self._account_combo.addItem(_a, _a)
+        self._account_combo.currentIndexChanged.connect(self._on_account_changed)
+        top.addWidget(self._account_combo)
         self.btn_hold = QPushButton("💼 管理持仓"); self.btn_hold.setFont(QFont("Microsoft YaHei",9))
         self.btn_hold.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef9f0;color:#16a34a;border:none;}QPushButton:hover{background:#dcf3e1;}")
         self.btn_hold.clicked.connect(self._open_hold); top.addWidget(self.btn_hold)
@@ -2503,7 +2761,12 @@ class MainWindow(QMainWindow):
 
     def _apply_results(self):
         price_map = {d["code"]: d.get("nav",0) for d in self.last_results if d.get("status")=="ok"}
-        self.resolved, self.corrected_codes = resolve_holdings(load_holdings(), price_map)
+        account = self._account_combo.currentData() if hasattr(self, '_account_combo') else "__all__"
+        if account == "__all__":
+            holdings = load_holdings()
+        else:
+            holdings = load_holdings_for_account(account)
+        self.resolved, self.corrected_codes = resolve_holdings(holdings, price_map)
         self._cleared_codes = load_show_state()
         act = [d for d in self.last_results if d["code"] not in self._cleared_codes]
         for d in act:
@@ -2588,9 +2851,18 @@ class MainWindow(QMainWindow):
 
     def _open_hold(self):
         price_map = {d["code"]: d.get("nav",0) for d in self.last_results if d.get("status")=="ok"}
-        dlg = HoldDialog(self.resolved, self.corrected_codes, price_map, self)
+        account = self._account_combo.currentData() if hasattr(self, '_account_combo') else "__all__"
+        if account == "__all__":
+            account = load_accounts()[0]
+        holdings = load_holdings_for_account(account)
+        resolved, corrected = resolve_holdings(holdings, price_map)
+        dlg = HoldDialog(resolved, corrected, price_map, self, account)
         dlg.finished.connect(lambda _: self._refresh_home() if dlg.saved else None)
         dlg.exec()
+
+    def _on_account_changed(self):
+        if self.last_results:
+            self._apply_results()
 
     def _open_detail(self, code): self.detail.load(code, self.resolved.get(code, {})); self.stack.setCurrentIndex(1)
     def _go_home(self): self.stack.setCurrentIndex(0)
@@ -2673,7 +2945,7 @@ class MainWindow(QMainWindow):
             if card: self.cards_layout.removeWidget(card); card.deleteLater()
             self.last_results = [x for x in self.last_results if x.get("code") != c]
             if clear_hold:
-                h = load_holdings(); h.pop(c, None); save_holdings(h)
+                _remove_code_from_all_accounts(c)
             self._redraw_aggregates(); rebuild()
             self._sync_empty_banner()
         rebuild(); d.exec()
