@@ -1,6 +1,11 @@
 # 基金日报
 
-Windows 桌面基金看板：实时行情、持仓盈亏、红黑榜、涨跌柱状图、已清仓灰章、交易记录与收益日历、多账户管理、一键备份、一键导出 Excel。行情取自公募基金接口；**全部持仓与交易数据仅存本地磁盘，不上传**。
+![最新版本](https://img.shields.io/github/v/release/GoldenMoon-cell/fund-daily-report?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&color=blue)
+![总下载量](https://img.shields.io/github/downloads/GoldenMoon-cell/fund-daily-report/total?label=%E6%80%BB%E4%B8%8B%E8%BD%BD%E9%87%8F)
+![License](https://img.shields.io/badge/License-MIT-green)
+![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows%2010%2F11%20%C2%B7%20macOS%2013+-lightgrey)
+
+Windows / macOS 双平台桌面基金看板：实时行情、持仓盈亏、红黑榜、涨跌柱状图、已清仓灰章、交易记录与收益日历、多账户管理、一键备份、一键导出 Excel。行情取自公募基金接口；**全部持仓与交易数据仅存本地磁盘，不上传**。当前 v1.0.0 正式发布（首次双端），功能集已稳定；后续 1.x 为增量更新（双端），2.0.0 将带来 UI 焕新。
 
 ## 功能
 
@@ -13,6 +18,7 @@ Windows 桌面基金看板：实时行情、持仓盈亏、红黑榜、涨跌柱
 - 📥 导出 Excel：持仓、交易流水、收益明细、行情快照，勾选后一键导出为一个 Excel（每类数据一个 sheet）
 - 📂 多账户：每个账户对应一个平台（支付宝/天天基金/招行等），持仓按账户独立核算，首页可切换“全部账户”或单个账户查看；支持账户间转移持仓
 - 🗄 一键备份：把所有数据文件打包成 zip，可设置默认目录一键直达
+- ℹ 关于本软件：版本信息 / GitHub 链接 / 隐私声明 / 免责声明 / 手动检查更新
 - 🚫 已清仓灰章：卖掉的基金盖灰章，不再计入合计与榜单，卡片仅观察；可随时恢复，状态存 `基金显示.json`
 
 ## 运行
@@ -25,9 +31,10 @@ python app.py
 
 ```
 
-到 Releases 下载 zip，解压到同一文件夹，双击 exe 运行，详见 `使用说明.txt`。首次运行，在首页「➕ 快速添加」加入第一只基金，会在 exe 同目录自动创建 `自定义基金.json`（看板名单）。
+到 Releases 下载对应平台的 zip（Windows 版 / macOS 版），解压到同一文件夹运行，详见 `使用说明.txt`。Windows 双击 exe；macOS 首次需右键 app → 打开（未签名应用的正常拦截）。首次运行，在首页「➕ 快速添加」加入第一只基金，会在程序同目录自动创建 `自定义基金.json`（看板名单）。
 
-> 首次打开若提示"Windows 已保护你的电脑"：这是未签名的正常现象（SmartScreen），非病毒。点「更多信息」→「仍要运行」即可。
+> Windows 首次打开若提示“Windows 已保护你的电脑”：这是未签名的正常现象（SmartScreen），非病毒。点「更多信息」→「仍要运行」即可。
+> macOS 首次打开若提示“无法验证开发者”：同样是未签名的正常现象，右键 app →「打开」即可。
 
 ## 本地文件说明（均不入库）
 

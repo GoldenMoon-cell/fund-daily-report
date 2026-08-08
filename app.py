@@ -33,9 +33,16 @@ import pyqtgraph as pg
 # 工作目录固定为程序所在目录，保证相对路径在源码/脚本/打包环境下行为一致
 if getattr(sys, 'frozen', False):
     _BASE = os.path.dirname(sys.executable)
+    # macOS .app 包：数据文件落在 .app 外部同级目录，不进包内（v1.0.0 双端适配；
+    # 首版误写包内已被用户实机捆出，本版修正）
+    if sys.platform == "darwin" and _BASE.endswith(".app/Contents/MacOS"):
+        _BASE = os.path.dirname(_BASE[:-len("/Contents/MacOS")])
 else:
     _BASE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(_BASE)
+
+# 跨平台 UI 字体：Windows 用微软雅黑，macOS 用苹方（v1.0.0 双端适配）
+FONT = "Microsoft YaHei" if sys.platform == "win32" else "PingFang SC"
 
 FUNDS = []   # 看板基金全部来自「自定义基金.json」；初始为空看板，用户经首页『快速添加』自行建立名单
 EXTRA_FILE = "自定义基金.json"
@@ -104,7 +111,7 @@ SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
 SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "0.7.0"
+APP_VERSION = "1.0.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -676,18 +683,24 @@ class IndexWorker(QThread):
 
 class UpdateWorker(QThread):
     found = Signal(str, str)
+    checked = Signal(bool, str, str)  # v1.0.0：“关于”对话框手动检查用（是否有新版, tag, url）；启动自动检查不连此信号，不受影响
+    def __init__(self, timeout=3):
+        super().__init__(); self._timeout = timeout
     def run(self):
         try:
             req = urllib.request.Request(
                 f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
                 headers={"User-Agent": "fund-daily-report", "Accept": "application/vnd.github+json"})
-            with urllib.request.urlopen(req, timeout=3, context=_SSL) as r:
+            with urllib.request.urlopen(req, timeout=self._timeout, context=_SSL) as r:
                 d = json.loads(r.read().decode("utf-8", errors="ignore"))
             tag = (d.get("tag_name") or "").strip().lstrip("vV")
             if tag and self._ver_tuple(tag) > self._ver_tuple(APP_VERSION):
                 self.found.emit(tag, d.get("html_url", ""))
+                self.checked.emit(True, tag, d.get("html_url", ""))
+                return
+            self.checked.emit(False, APP_VERSION, "")
         except Exception:
-            pass  # 无网/失败静默跳过；windowed 版无 stdout，绝不可 print
+            self.checked.emit(False, "", "")  # 无网/失败：启动自动检查没连 checked，依旧静默跳过；windowed 版无 stdout，绝不可 print
     def _ver_tuple(self, s):
         t = []
         for x in (s or "").strip().split("."):
@@ -726,7 +739,7 @@ class BarChart(pg.PlotWidget):
             self._anim_timer.stop(); self._anim_timer = None
         vals = [it[1] for it in items]
         if not any(v != 0 for v in vals):
-            t = pg.TextItem("暂无涨跌数据", color=(150,150,150), anchor=(0.5,0.5)); t.setFont(QFont("Microsoft YaHei",11)); self.addItem(t); t.setPos(len(vals)/2,0); return
+            t = pg.TextItem("暂无涨跌数据", color=(150,150,150), anchor=(0.5,0.5)); t.setFont(QFont(FONT,11)); self.addItem(t); t.setPos(len(vals)/2,0); return
         names = [it[0][:4] for it in items]; colors = [RED if v >= 0 else GREEN for v in vals]; x = list(range(len(vals)))
         self._bars_x = x; self._bars_vals = vals; self._bars_colors = colors; self._bars_names = names
         self._bar_item = pg.BarGraphItem(x=x, height=[0.0]*len(vals), width=0.6, brushes=colors, pens=colors)
@@ -750,7 +763,7 @@ class BarChart(pg.PlotWidget):
         if self._bar_item:
             self._bar_item.setOpts(height=self._bars_vals)
         for xi, v in zip(self._bars_x, self._bars_vals):
-            t = pg.TextItem(f"{v:+.2f}%", color=(0,0,0), anchor=(0.5, 1 if v >= 0 else 0)); t.setFont(QFont("Microsoft YaHei",8)); self.addItem(t); t.setPos(xi, v)
+            t = pg.TextItem(f"{v:+.2f}%", color=(0,0,0), anchor=(0.5, 1 if v >= 0 else 0)); t.setFont(QFont(FONT,8)); self.addItem(t); t.setPos(xi, v)
 
 
 class ElideLabel(QLabel):
@@ -774,24 +787,24 @@ class FundCard(QFrame):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         lay = QHBoxLayout(self); lay.setContentsMargins(14,12,14,12)
         left = QVBoxLayout(); left.setSpacing(2)
-        self.lbl_name = ElideLabel("—"); self.lbl_name.setFont(QFont("Microsoft YaHei",11,QFont.Bold))
+        self.lbl_name = ElideLabel("—"); self.lbl_name.setFont(QFont(FONT,11,QFont.Bold))
         self.lbl_name.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); self.lbl_name.setMinimumWidth(0)
-        self.lbl_code = QLabel(code); self.lbl_code.setFont(QFont("Microsoft YaHei",8)); self.lbl_code.setStyleSheet("color:#999;")
+        self.lbl_code = QLabel(code); self.lbl_code.setFont(QFont(FONT,8)); self.lbl_code.setStyleSheet("color:#999;")
         left.addWidget(self.lbl_name); left.addWidget(self.lbl_code); lay.addLayout(left,3)
         mid = QVBoxLayout(); mid.setSpacing(2)
-        self.lbl_nav = QLabel("净值 —"); self.lbl_nav.setFont(QFont("Microsoft YaHei",9)); self.lbl_nav.setStyleSheet("color:#666;")
+        self.lbl_nav = QLabel("净值 —"); self.lbl_nav.setFont(QFont(FONT,9)); self.lbl_nav.setStyleSheet("color:#666;")
         self.lbl_nav.setMinimumWidth(0)
-        self.lbl_mv = QLabel(""); self.lbl_mv.setFont(QFont("Microsoft YaHei",9,QFont.Bold)); self.lbl_mv.setStyleSheet("color:#222;"); self.lbl_mv.setMinimumWidth(0)
-        self.lbl_today = QLabel("今日 —"); self.lbl_today.setFont(QFont("Microsoft YaHei",9,QFont.Bold)); self.lbl_today.setMinimumWidth(0)
-        self.lbl_pnl = QLabel("累计 —"); self.lbl_pnl.setFont(QFont("Microsoft YaHei",8)); self.lbl_pnl.setMinimumWidth(0)
+        self.lbl_mv = QLabel(""); self.lbl_mv.setFont(QFont(FONT,9,QFont.Bold)); self.lbl_mv.setStyleSheet("color:#222;"); self.lbl_mv.setMinimumWidth(0)
+        self.lbl_today = QLabel("今日 —"); self.lbl_today.setFont(QFont(FONT,9,QFont.Bold)); self.lbl_today.setMinimumWidth(0)
+        self.lbl_pnl = QLabel("累计 —"); self.lbl_pnl.setFont(QFont(FONT,8)); self.lbl_pnl.setMinimumWidth(0)
         mid.addWidget(self.lbl_nav); mid.addWidget(self.lbl_mv); mid.addWidget(self.lbl_today); mid.addWidget(self.lbl_pnl); lay.addLayout(mid,2)
-        self.lbl_chg = QLabel("—"); self.lbl_chg.setFont(QFont("Microsoft YaHei",16,QFont.Bold)); self.lbl_chg.setAlignment(Qt.AlignCenter); lay.addWidget(self.lbl_chg,2)
+        self.lbl_chg = QLabel("—"); self.lbl_chg.setFont(QFont(FONT,16,QFont.Bold)); self.lbl_chg.setAlignment(Qt.AlignCenter); lay.addWidget(self.lbl_chg,2)
         right = QVBoxLayout(); right.setSpacing(6)
-        self.btn_clear = QPushButton("标记清仓"); self.btn_clear.setFont(QFont("Microsoft YaHei",8))
+        self.btn_clear = QPushButton("标记清仓"); self.btn_clear.setFont(QFont(FONT,8))
         self.btn_clear.setCheckable(True)
         self.btn_clear.setStyleSheet("QPushButton{padding:4px 8px;border-radius:6px;background:#f5f5f5;color:#888;border:1px solid #ddd;}QPushButton:hover{background:#eee;}QPushButton:checked{background:#e8e8e8;color:#555;border:1px dashed #999;}")
         right.addWidget(self.btn_clear)
-        self.btn_detail = QPushButton("详情 →"); self.btn_detail.setFont(QFont("Microsoft YaHei",9))
+        self.btn_detail = QPushButton("详情 →"); self.btn_detail.setFont(QFont(FONT,9))
         self.btn_detail.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef3ff;color:#2563eb;border:none;}QPushButton:hover{background:#dbe6ff;}")
         right.addWidget(self.btn_detail,1); lay.addLayout(right,1)
 
@@ -866,26 +879,26 @@ class DetailPage(QWidget):
         self._idx_cache={}; self._idx_err={}; self._fund_y_by_idx={}
         lay = QVBoxLayout(self); lay.setContentsMargins(18,14,18,14); lay.setSpacing(10)
         top = QHBoxLayout()
-        self.btn_back = QPushButton("← 返回"); self.btn_back.setFont(QFont("Microsoft YaHei",10))
+        self.btn_back = QPushButton("← 返回"); self.btn_back.setFont(QFont(FONT,10))
         self.btn_back.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#f0f0f0;border:none;}QPushButton:hover{background:#e3e3e3;}")
         self.btn_back.clicked.connect(on_back); top.addWidget(self.btn_back)
-        self.lbl_title = QLabel("基金详情"); self.lbl_title.setFont(QFont("Microsoft YaHei",14,QFont.Bold)); top.addWidget(self.lbl_title)
+        self.lbl_title = QLabel("基金详情"); self.lbl_title.setFont(QFont(FONT,14,QFont.Bold)); top.addWidget(self.lbl_title)
         top.addStretch()
-        self.lbl_my = QLabel(""); self.lbl_my.setFont(QFont("Microsoft YaHei",10)); top.addWidget(self.lbl_my); lay.addLayout(top)
-        self.lbl_track = QLabel(""); self.lbl_track.setFont(QFont("Microsoft YaHei",8))
+        self.lbl_my = QLabel(""); self.lbl_my.setFont(QFont(FONT,10)); top.addWidget(self.lbl_my); lay.addLayout(top)
+        self.lbl_track = QLabel(""); self.lbl_track.setFont(QFont(FONT,8))
         self.lbl_track.setStyleSheet("QLabel{color:#6b7280;background:#f7f9fc;border:1px solid #eef0f3;border-radius:6px;padding:4px 8px;}")
         self.lbl_track.setWordWrap(True); self.lbl_track.hide(); lay.addWidget(self.lbl_track)
         vbar = QHBoxLayout()
         self._vbg = QButtonGroup(self); self._vbtns = {}
         for i,(k,ico) in enumerate([("nav","📈 净值走势"),("dd","📉 回撤修复"),("rank","🏅 同类排名")]):
-            b = QPushButton(ico); b.setCheckable(True); b.setFont(QFont("Microsoft YaHei",9))
+            b = QPushButton(ico); b.setCheckable(True); b.setFont(QFont(FONT,9))
             b.setStyleSheet("QPushButton{padding:6px 14px;border:1px solid #ddd;border-radius:7px;background:#fff;}"
                             "QPushButton:checked{background:#374151;color:#fff;border-color:#374151;}")
             self._vbg.addButton(b,i); self._vbtns[k]=b; vbar.addWidget(b)
         self._vbtns["nav"].setChecked(True); self._vbg.buttonClicked.connect(lambda _: self._set_view())
         vbar.addStretch()
         self._cmp_lbl = QLabel("对比"); self._cmp_lbl.setStyleSheet("color:#666;font-size:9px;"); vbar.addWidget(self._cmp_lbl)
-        self._cmp_combo = QComboBox(); self._cmp_combo.setFont(QFont("Microsoft YaHei",9))
+        self._cmp_combo = QComboBox(); self._cmp_combo.setFont(QFont(FONT,9))
         self._cmp_combo.addItem("不对比", None)
         for secid, nm in CMP_INDEX:
             self._cmp_combo.addItem(nm, secid)
@@ -895,14 +908,14 @@ class DetailPage(QWidget):
         lay.addLayout(vbar)
         rbar = QHBoxLayout(); rbar.addStretch(); self._bg = QButtonGroup(self); self._rbtns = {}
         for i,k in enumerate(RANGE_DAYS.keys()):
-            b = QPushButton(k); b.setCheckable(True); b.setFont(QFont("Microsoft YaHei",9))
+            b = QPushButton(k); b.setCheckable(True); b.setFont(QFont(FONT,9))
             b.setStyleSheet("QPushButton{padding:6px 12px;border:1px solid #ddd;border-radius:7px;background:#fff;}QPushButton:checked{background:#2563eb;color:#fff;border-color:#2563eb;}")
             self._bg.addButton(b,i); self._rbtns[k]=b; rbar.addWidget(b)
         self._rbtns["近1年"].setChecked(True); self._bg.buttonClicked.connect(lambda _: self._apply_range()); lay.addLayout(rbar)
         self.dd_box = QFrame(); self.dd_box.setStyleSheet("QFrame{background:#fff5f5;border:1px solid #f3c2c2;border-radius:10px;}")
         dl = QHBoxLayout(self.dd_box); dl.setContentsMargins(14,10,14,10)
-        self.lbl_dd_max = QLabel("最大回撤  —"); self.lbl_dd_max.setFont(QFont("Microsoft YaHei",11,QFont.Bold)); self.lbl_dd_max.setStyleSheet("color:#c0392b;")
-        self.lbl_dd_rep = QLabel("修复  —"); self.lbl_dd_rep.setFont(QFont("Microsoft YaHei",11,QFont.Bold)); self.lbl_dd_rep.setStyleSheet("color:#888;")
+        self.lbl_dd_max = QLabel("最大回撤  —"); self.lbl_dd_max.setFont(QFont(FONT,11,QFont.Bold)); self.lbl_dd_max.setStyleSheet("color:#c0392b;")
+        self.lbl_dd_rep = QLabel("修复  —"); self.lbl_dd_rep.setFont(QFont(FONT,11,QFont.Bold)); self.lbl_dd_rep.setStyleSheet("color:#888;")
         dl.addWidget(self.lbl_dd_max); dl.addSpacing(28); dl.addWidget(self.lbl_dd_rep); dl.addStretch()
         self.dd_box.hide(); lay.addWidget(self.dd_box)
         chart_box = QFrame(); chart_box.setStyleSheet("QFrame{background:#fff;border:1px solid #eee;border-radius:10px;}")
@@ -933,31 +946,31 @@ class DetailPage(QWidget):
         self._zero_line = pg.InfiniteLine(pos=0, angle=0, movable=False, pen=pg.mkPen("#10b981", width=1.6, style=Qt.DashLine))
         self._zero_line.hide(); self.plot.addItem(self._zero_line)
         self._zero_label = pg.TextItem("前高线 0%  回到此线=修复", color=(16,185,129), anchor=(1,0))
-        self._zero_label.setFont(QFont("Microsoft YaHei",8,QFont.Bold)); self._zero_label.hide(); self.plot.addItem(self._zero_label)
+        self._zero_label.setFont(QFont(FONT,8,QFont.Bold)); self._zero_label.hide(); self.plot.addItem(self._zero_label)
         self._dd_marker = pg.ScatterPlotItem(size=18, pen=pg.mkPen("#fff",width=2), brush=pg.mkBrush("#dc2626"))
         self._dd_marker.hide(); self.plot.addItem(self._dd_marker)
         self._repair_marker = pg.ScatterPlotItem(size=15, pen=pg.mkPen("#fff",width=2), brush=pg.mkBrush("#16a34a"))
         self._repair_marker.hide(); self.plot.addItem(self._repair_marker)
-        self._dd_label = pg.TextItem("", color=(220,38,38), anchor=(0.5,0)); self._dd_label.setFont(QFont("Microsoft YaHei",9,QFont.Bold)); self._dd_label.hide(); self.plot.addItem(self._dd_label)
-        self._repair_label = pg.TextItem("", color=(22,163,74), anchor=(0.5,1)); self._repair_label.setFont(QFont("Microsoft YaHei",9,QFont.Bold)); self._repair_label.hide(); self.plot.addItem(self._repair_label)
-        self._region_label = pg.TextItem("", color=(180,90,20), anchor=(0.5,0.5)); self._region_label.setFont(QFont("Microsoft YaHei",8,QFont.Bold)); self._region_label.hide(); self.plot.addItem(self._region_label)
+        self._dd_label = pg.TextItem("", color=(220,38,38), anchor=(0.5,0)); self._dd_label.setFont(QFont(FONT,9,QFont.Bold)); self._dd_label.hide(); self.plot.addItem(self._dd_label)
+        self._repair_label = pg.TextItem("", color=(22,163,74), anchor=(0.5,1)); self._repair_label.setFont(QFont(FONT,9,QFont.Bold)); self._repair_label.hide(); self.plot.addItem(self._repair_label)
+        self._region_label = pg.TextItem("", color=(180,90,20), anchor=(0.5,0.5)); self._region_label.setFont(QFont(FONT,8,QFont.Bold)); self._region_label.hide(); self.plot.addItem(self._region_label)
         self._cost_line = pg.InfiniteLine(pos=0, angle=0, movable=False, pen=pg.mkPen("#7c3aed", width=1.6, style=Qt.DashLine))
         self._cost_line.hide(); self.plot.addItem(self._cost_line)
-        self._cost_label = pg.TextItem("", color=(124,58,237), anchor=(1,0.5)); self._cost_label.setFont(QFont("Microsoft YaHei",8,QFont.Bold)); self._cost_label.hide(); self.plot.addItem(self._cost_label)
+        self._cost_label = pg.TextItem("", color=(124,58,237), anchor=(1,0.5)); self._cost_label.setFont(QFont(FONT,8,QFont.Bold)); self._cost_label.hide(); self.plot.addItem(self._cost_label)
         self._buy_line = pg.InfiniteLine(pos=0, angle=90, movable=False, pen=pg.mkPen("#7c3aed", width=1.8, style=Qt.DashLine))
         self._buy_line.hide(); self.plot.addItem(self._buy_line)
         self._buy_dot = pg.ScatterPlotItem(size=16, pen=pg.mkPen("#fff",width=2), brush=pg.mkBrush("#7c3aed"))
         self._buy_dot.hide(); self.plot.addItem(self._buy_dot)
-        self._buy_label = pg.TextItem("", color=(124,58,237), anchor=(0,1)); self._buy_label.setFont(QFont("Microsoft YaHei",9,QFont.Bold)); self._buy_label.hide(); self.plot.addItem(self._buy_label)
-        self._buy_off = pg.TextItem("", color=(167,139,250), anchor=(0.5,0.5)); self._buy_off.setFont(QFont("Microsoft YaHei",9,QFont.Bold)); self._buy_off.hide(); self.plot.addItem(self._buy_off)
+        self._buy_label = pg.TextItem("", color=(124,58,237), anchor=(0,1)); self._buy_label.setFont(QFont(FONT,9,QFont.Bold)); self._buy_label.hide(); self.plot.addItem(self._buy_label)
+        self._buy_off = pg.TextItem("", color=(167,139,250), anchor=(0.5,0.5)); self._buy_off.setFont(QFont(FONT,9,QFont.Bold)); self._buy_off.hide(); self.plot.addItem(self._buy_off)
         self._legend = QLabel(""); self._legend.setParent(self.plot)
         self._legend.setStyleSheet("QLabel{background:rgba(255,255,255,225);border:1px solid #ddd;border-radius:6px;padding:4px 8px;color:#333;font-size:9px;}")
-        self._legend.setFont(QFont("Microsoft YaHei",9)); self._legend.hide(); self._legend.raise_()
+        self._legend.setFont(QFont(FONT,9)); self._legend.hide(); self._legend.raise_()
         self._readout = QLabel("移动鼠标看每日数值"); self._readout.setParent(self.plot)
         self._readout.setStyleSheet("QLabel{background:rgba(255,255,255,220);border:1px solid #ddd;border-radius:6px;padding:5px 8px;color:#333;}")
-        self._readout.setFont(QFont("Microsoft YaHei",9)); self._readout.move(10,8); self._readout.raise_()
+        self._readout.setFont(QFont(FONT,9)); self._readout.move(10,8); self._readout.raise_()
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
-        self._loading = QLabel("⏳  加载历史净值中…"); self._loading.setFont(QFont("Microsoft YaHei",12)); self._loading.setAlignment(Qt.AlignCenter); self._loading.setStyleSheet("color:#888;")
+        self._loading = QLabel("⏳  加载历史净值中…"); self._loading.setFont(QFont(FONT,12)); self._loading.setAlignment(Qt.AlignCenter); self._loading.setStyleSheet("color:#888;")
         self._stack_chart = QStackedWidget(); self._stack_chart.addWidget(self._loading); self._stack_chart.addWidget(self.plot)
         self._stack_chart.setFixedHeight(320); cl.addWidget(self._stack_chart); lay.addWidget(chart_box,3)
         self.table = QTableWidget(0,3); self.table.setHorizontalHeaderLabels(["日期","单位净值","当日涨跌"])
@@ -1374,7 +1387,7 @@ class PasteDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("把蚂蚁/天天基金里『持有份额、持仓成本价』那段【纯文本】整段复制粘贴到下面，点解析（不是csv/表格）：\n（注：『持有金额/市值』不会被导入——本金列需另行填写或留空。）\n⚠ 只认下面表里已有的基金（即首页看板上的基金）。列表外的新基金粘了会被悄悄跳过——要加新基金，请先回首页用『➕快速添加』，加完再来粘。"))
         self.te = QTextEdit(); self.te.setPlaceholderText("例如：\n某某指数基金C\n持有份额 1234.56\n持仓成本价 1.0000\n……（多只一起粘也行；只认份额+成本价）")
-        self.te.setFont(QFont("Microsoft YaHei",9)); lay.addWidget(self.te,3)
+        self.te.setFont(QFont(FONT,9)); lay.addWidget(self.te,3)
         self.lbl = QLabel(""); self.lbl.setStyleSheet("color:#555;"); self.lbl.setWordWrap(True); lay.addWidget(self.lbl)
         bar = QHBoxLayout(); bar.addStretch()
         b = QPushButton("🔍 解析"); b.clicked.connect(self._parse)
@@ -1781,7 +1794,7 @@ class HoldDialog(QDialog):
                 if w: w.deleteLater()
             for a in load_accounts():
                 row = QHBoxLayout()
-                lb = QLabel(a); lb.setFont(QFont("Microsoft YaHei", 10))
+                lb = QLabel(a); lb.setFont(QFont(FONT, 10))
                 row.addWidget(lb, 1)
                 if a != DEFAULT_ACCOUNT:
                     btn_rename = QPushButton("改名")
@@ -2168,17 +2181,17 @@ class PnlDialog(QDialog):
         for key, name in (("yest","昨日收益"), ("month","本月收益"), ("monthpct","本月收益率"), ("year","本年累计")):
             box = QVBoxLayout(); box.setSpacing(2)
             a = QLabel(name); a.setStyleSheet("color:#888;font-size:9px;"); a.setAlignment(Qt.AlignCenter)
-            b = QLabel("—"); b.setFont(QFont("Microsoft YaHei",13,QFont.Bold)); b.setAlignment(Qt.AlignCenter)
+            b = QLabel("—"); b.setFont(QFont(FONT,13,QFont.Bold)); b.setAlignment(Qt.AlignCenter)
             box.addWidget(a); box.addWidget(b); ol.addLayout(box)
             self._ov_lbls[key] = b
         L.addWidget(ov)
         nav = QHBoxLayout()
         self.btn_prev = QPushButton("‹"); self.btn_next = QPushButton("›")
         for b in (self.btn_prev, self.btn_next):
-            b.setFixedWidth(34); b.setFont(QFont("Microsoft YaHei",11,QFont.Bold))
+            b.setFixedWidth(34); b.setFont(QFont(FONT,11,QFont.Bold))
             b.setStyleSheet("QPushButton{border-radius:7px;background:#f0f0f0;}QPushButton:hover{background:#e3e3e3;}")
         self.btn_prev.clicked.connect(lambda: self._shift(-1)); self.btn_next.clicked.connect(lambda: self._shift(1))
-        self.lbl_month = QLabel(""); self.lbl_month.setFont(QFont("Microsoft YaHei",12,QFont.Bold)); self.lbl_month.setAlignment(Qt.AlignCenter)
+        self.lbl_month = QLabel(""); self.lbl_month.setFont(QFont(FONT,12,QFont.Bold)); self.lbl_month.setAlignment(Qt.AlignCenter)
         nav.addWidget(self.btn_prev); nav.addWidget(self.lbl_month,1); nav.addWidget(self.btn_next); L.addLayout(nav)
         self.grid = QGridLayout(); self.grid.setSpacing(4)
         for c, t in enumerate(("日","一","二","三","四","五","六")):
@@ -2195,7 +2208,7 @@ class PnlDialog(QDialog):
             self._cells.append(row)
         L.addLayout(self.grid)
         self.lbl_day = QLabel("点日历上某一天，看每只基金当天贡献 ↓")
-        self.lbl_day.setFont(QFont("Microsoft YaHei",10,QFont.Bold)); self.lbl_day.setStyleSheet("color:#333;")
+        self.lbl_day.setFont(QFont(FONT,10,QFont.Bold)); self.lbl_day.setStyleSheet("color:#333;")
         L.addWidget(self.lbl_day)
         self.tbl = QTableWidget(0,4); self.tbl.setHorizontalHeaderLabels(["基金","当日盈亏(元)","当日涨跌","备注"])
         self.tbl.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch)
@@ -2609,7 +2622,7 @@ class ExportDialog(QDialog):
         pnl = getattr(parent, "_pnl_dialog", None)
         has_pnl = bool(pnl) and bool(getattr(pnl, "_hist", None))
         for key, title in self.SECTIONS:
-            cb = QCheckBox(title); cb.setFont(QFont("Microsoft YaHei", 10))
+            cb = QCheckBox(title); cb.setFont(QFont(FONT, 10))
             if key == "pnl" and not has_pnl:
                 cb.setEnabled(False)
                 cb.setToolTip("请先打开「📅 收益明细」并等待抓取完成，再回来导出")
@@ -2712,8 +2725,8 @@ class MainWindow(QMainWindow):
     def _build_home(self):
         w = QWidget(); outer = QVBoxLayout(w); outer.setContentsMargins(18,16,18,16); outer.setSpacing(12)
         top = QHBoxLayout()
-        title = QLabel("📊  基金日报"); title.setFont(QFont("Microsoft YaHei",16,QFont.Bold)); top.addWidget(title); top.addStretch()
-        ver = QLabel(f"v{APP_VERSION}"); ver.setFont(QFont("Microsoft YaHei", 9)); ver.setStyleSheet("color:#999;")
+        title = QLabel("📊  基金日报"); title.setFont(QFont(FONT,16,QFont.Bold)); top.addWidget(title); top.addStretch()
+        ver = QLabel(f"v{APP_VERSION}"); ver.setFont(QFont(FONT, 9)); ver.setStyleSheet("color:#999;")
         top.addWidget(ver)
         self.lbl_time = QLabel(""); self.lbl_time.setStyleSheet("color:#999;"); top.addWidget(self.lbl_time)
         top.addWidget(QLabel("账户:"))
@@ -2723,35 +2736,39 @@ class MainWindow(QMainWindow):
             self._account_combo.addItem(_a, _a)
         self._account_combo.currentIndexChanged.connect(self._on_account_changed)
         top.addWidget(self._account_combo)
-        self.btn_hold = QPushButton("💼 管理持仓"); self.btn_hold.setFont(QFont("Microsoft YaHei",9))
+        self.btn_hold = QPushButton("💼 管理持仓"); self.btn_hold.setFont(QFont(FONT,9))
         self.btn_hold.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef9f0;color:#16a34a;border:none;}QPushButton:hover{background:#dcf3e1;}")
         self.btn_hold.clicked.connect(self._open_hold); top.addWidget(self.btn_hold)
-        self.btn_diag = QPushButton("🩺 诊断"); self.btn_diag.setFont(QFont("Microsoft YaHei",9))
+        self.btn_diag = QPushButton("🩺 诊断"); self.btn_diag.setFont(QFont(FONT,9))
         self.btn_diag.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#f0f0f0;border:none;}QPushButton:hover{background:#e3e3e3;}")
         self.btn_diag.clicked.connect(self._show_diag); top.addWidget(self.btn_diag)
-        self.btn_pnl = QPushButton("📅 收益明细"); self.btn_pnl.setFont(QFont("Microsoft YaHei",9))
+        self.btn_pnl = QPushButton("📅 收益明细"); self.btn_pnl.setFont(QFont(FONT,9))
         self.btn_pnl.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#fff7ed;color:#ea580c;border:none;}QPushButton:hover{background:#ffedd5;}")
         self.btn_pnl.clicked.connect(self._open_pnl); top.addWidget(self.btn_pnl)
         self.btn_trades = QPushButton("📒 交易记录")
         self.btn_trades.clicked.connect(lambda: TradesDialog(self).exec());top.addWidget(self.btn_trades)
-        self.btn_trades.setFont(QFont("Microsoft YaHei",9))
+        self.btn_trades.setFont(QFont(FONT,9))
         self.btn_trades.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef2ff;color:#4f46e5;border:none;}QPushButton:hover{background:#e0e7ff;}")
         self.btn_export = QPushButton("📥 导出")
         self.btn_export.clicked.connect(self._open_export); top.addWidget(self.btn_export)
-        self.btn_export.setFont(QFont("Microsoft YaHei",9))
+        self.btn_export.setFont(QFont(FONT,9))
         self.btn_export.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#ecfeff;color:#0891b2;border:none;}QPushButton:hover{background:#cffafe;}")
         self.btn_backup = QPushButton("🗄 备份")
         self.btn_backup.clicked.connect(self._open_backup); top.addWidget(self.btn_backup)
-        self.btn_backup.setFont(QFont("Microsoft YaHei",9))
+        self.btn_backup.setFont(QFont(FONT,9))
         self.btn_backup.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#fef3c7;color:#92400e;border:none;}QPushButton:hover{background:#fde68a;}")
+        self.btn_about = QPushButton("ℹ 关于")
+        self.btn_about.clicked.connect(self._open_about); top.addWidget(self.btn_about)
+        self.btn_about.setFont(QFont(FONT,9))
+        self.btn_about.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#f5f5f5;color:#555;border:none;}QPushButton:hover{background:#e8e8e8;}")
         # 「📸 最新快照」按钮已随 OCR 一并移除
-        self.btn_refresh = QPushButton("🔄  刷新数据"); self.btn_refresh.setFont(QFont("Microsoft YaHei",10))
+        self.btn_refresh = QPushButton("🔄  刷新数据"); self.btn_refresh.setFont(QFont(FONT,10))
         self.btn_refresh.setStyleSheet("QPushButton{padding:9px 16px;border-radius:8px;background:#2563eb;color:#fff;border:none;}QPushButton:hover{background:#1d4ed8;}QPushButton:disabled{background:#bbb;}")
         self.btn_refresh.clicked.connect(self._refresh_home); top.addWidget(self.btn_refresh); outer.addLayout(top)
         self.summary = QFrame(); self.summary.setStyleSheet("QFrame{background:#f7f9fc;border-radius:10px;}")
         sl = QHBoxLayout(self.summary); sl.setContentsMargins(16,12,16,12)
-        self.lbl_total = QLabel("总持仓市值  —"); self.lbl_total.setFont(QFont("Microsoft YaHei",11,QFont.Bold))
-        self.lbl_today = QLabel("今日盈亏  —"); self.lbl_today.setFont(QFont("Microsoft YaHei",11,QFont.Bold))
+        self.lbl_total = QLabel("总持仓市值  —"); self.lbl_total.setFont(QFont(FONT,11,QFont.Bold))
+        self.lbl_today = QLabel("今日盈亏  —"); self.lbl_today.setFont(QFont(FONT,11,QFont.Bold))
         sl.addWidget(self.lbl_total); sl.addStretch(); sl.addWidget(self.lbl_today); outer.addWidget(self.summary)
         self.lbl_fix = QLabel(""); self.lbl_fix.setStyleSheet("QLabel{color:#9a6b00;background:#fff7d6;border:1px solid #f0d97a;border-radius:8px;padding:8px 12px;}")
         self.lbl_fix.setWordWrap(True); self.lbl_fix.hide(); outer.addWidget(self.lbl_fix)
@@ -2766,30 +2783,30 @@ class MainWindow(QMainWindow):
         left_wrap = QWidget(); left_col = QVBoxLayout(left_wrap); left_col.setContentsMargins(0,0,0,0); left_col.setSpacing(10)
         add_box = QFrame(); add_box.setStyleSheet("QFrame{background:#fff;border:1px solid #eee;border-radius:10px;}")
         abl = QHBoxLayout(add_box); abl.setContentsMargins(12,10,12,10)
-        atitle = QLabel("➕ 快速添加"); atitle.setFont(QFont("Microsoft YaHei",9,QFont.Bold)); abl.addWidget(atitle)
-        self._add_input = QLineEdit(); self._add_input.setPlaceholderText("6位代码 如 000001"); self._add_input.setFont(QFont("Microsoft YaHei",9))
+        atitle = QLabel("➕ 快速添加"); atitle.setFont(QFont(FONT,9,QFont.Bold)); abl.addWidget(atitle)
+        self._add_input = QLineEdit(); self._add_input.setPlaceholderText("6位代码 如 000001"); self._add_input.setFont(QFont(FONT,9))
         self._add_input.setFixedWidth(150); self._add_input.setStyleSheet("QLineEdit{padding:6px 8px;border:1px solid #ddd;border-radius:7px;}")
         abl.addWidget(self._add_input)
-        self._add_btn = QPushButton("添加"); self._add_btn.setFont(QFont("Microsoft YaHei",9))
+        self._add_btn = QPushButton("添加"); self._add_btn.setFont(QFont(FONT,9))
         self._add_btn.setStyleSheet("QPushButton{padding:6px 14px;border-radius:7px;background:#2563eb;color:#fff;border:none;}QPushButton:hover{background:#1d4ed8;}QPushButton:disabled{background:#bbb;}")
         self._add_btn.clicked.connect(self._add_fund); abl.addWidget(self._add_btn)
-        self._rm_btn = QPushButton("🗑 移除自加"); self._rm_btn.setFont(QFont("Microsoft YaHei",9))
+        self._rm_btn = QPushButton("🗑 移除自加"); self._rm_btn.setFont(QFont(FONT,9))
         self._rm_btn.setStyleSheet("QPushButton{padding:6px 12px;border-radius:7px;background:#fdecea;color:#b3261e;border:1px solid #f5b7b1;}QPushButton:hover{background:#f8d7da;}")
         self._rm_btn.clicked.connect(self._remove_custom_fund); abl.addWidget(self._rm_btn)
         abl.addStretch()
         left_col.addWidget(add_box)
         chart_box = QFrame(); chart_box.setStyleSheet("QFrame{background:#fff;border:1px solid #eee;border-radius:10px;}")
         cl = QVBoxLayout(chart_box); cl.setContentsMargins(8,8,8,4)
-        ctitle = QLabel("📈  今日涨跌一览（涨红跌绿）"); ctitle.setFont(QFont("Microsoft YaHei",10,QFont.Bold)); cl.addWidget(ctitle)
+        ctitle = QLabel("📈  今日涨跌一览（涨红跌绿）"); ctitle.setFont(QFont(FONT,10,QFont.Bold)); cl.addWidget(ctitle)
         self.chart = BarChart(); self.chart.setFixedHeight(180); cl.addWidget(self.chart); left_col.addWidget(chart_box)
         self.board = QFrame(); self.board.setStyleSheet("QFrame{background:#fff;border:1px solid #eee;border-radius:10px;}")
         bl = QHBoxLayout(self.board); bl.setContentsMargins(14,10,14,10)
-        self._red_col = QVBoxLayout(); rh = QLabel("🔥 今日红榜"); rh.setFont(QFont("Microsoft YaHei",10,QFont.Bold)); rh.setStyleSheet("color:#e53935;"); self._red_col.addWidget(rh)
+        self._red_col = QVBoxLayout(); rh = QLabel("🔥 今日红榜"); rh.setFont(QFont(FONT,10,QFont.Bold)); rh.setStyleSheet("color:#e53935;"); self._red_col.addWidget(rh)
         self._red_rows = [QLabel("—") for _ in range(3)]
-        for lb in self._red_rows: lb.setFont(QFont("Microsoft YaHei",9)); lb.setStyleSheet("color:#c0392b;"); self._red_col.addWidget(lb)
-        self._green_col = QVBoxLayout(); gh = QLabel("💧 今日黑榜"); gh.setFont(QFont("Microsoft YaHei",10,QFont.Bold)); gh.setStyleSheet("color:#16a34a;"); self._green_col.addWidget(gh)
+        for lb in self._red_rows: lb.setFont(QFont(FONT,9)); lb.setStyleSheet("color:#c0392b;"); self._red_col.addWidget(lb)
+        self._green_col = QVBoxLayout(); gh = QLabel("💧 今日黑榜"); gh.setFont(QFont(FONT,10,QFont.Bold)); gh.setStyleSheet("color:#16a34a;"); self._green_col.addWidget(gh)
         self._green_rows = [QLabel("—") for _ in range(3)]
-        for lb in self._green_rows: lb.setFont(QFont("Microsoft YaHei",9)); lb.setStyleSheet("color:#15803d;"); self._green_col.addWidget(lb)
+        for lb in self._green_rows: lb.setFont(QFont(FONT,9)); lb.setStyleSheet("color:#15803d;"); self._green_col.addWidget(lb)
         bl.addLayout(self._red_col); bl.addSpacing(20); bl.addLayout(self._green_col); left_col.addWidget(self.board)
         # 快照全貌区已随 OCR 移除（lbl_snap_total / snap_box 不再创建）
         left_col.addStretch()
@@ -2995,6 +3012,41 @@ class MainWindow(QMainWindow):
             if msg.clickedButton() is b_remember:
                 settings["backup_dir"] = os.path.dirname(save_path); save_settings(settings)
 
+    def _open_about(self):
+        """v1.0.0 新增：关于本软件（版本信息 / GitHub 链接 / 隐私声明 / 免责声明 / 手动检查更新）。"""
+        dlg = QDialog(self); dlg.setWindowTitle("关于本软件"); dlg.resize(460, 420)
+        lay = QVBoxLayout(dlg); lay.setSpacing(8)
+        t = QLabel("📊 基金日报"); t.setFont(QFont(FONT,18,QFont.Bold)); t.setAlignment(Qt.AlignCenter); lay.addWidget(t)
+        v = QLabel(f"v{APP_VERSION} · 正式发布"); v.setAlignment(Qt.AlignCenter); v.setStyleSheet("color:#2563eb;font-weight:bold;"); lay.addWidget(v)
+        desc = QLabel("Windows 个人基金看板：实时行情 / 持仓盈亏 / 收益日历 / 多账户 / 一键备份 / 导出 Excel。\n全部持仓与交易数据仅存本地磁盘，不上传。")
+        desc.setAlignment(Qt.AlignCenter); desc.setWordWrap(True); desc.setStyleSheet("color:#555;"); lay.addWidget(desc)
+        link = QLabel(f'<a href="https://github.com/{GITHUB_REPO}">github.com/{GITHUB_REPO}</a>')
+        link.setTextFormat(Qt.RichText); link.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        link.setOpenExternalLinks(True); link.setAlignment(Qt.AlignCenter); lay.addWidget(link)
+        b_check = QPushButton("🔄 立即检查更新")
+        b_check.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#eef3ff;color:#2563eb;border:none;}QPushButton:hover{background:#dbe6ff;}QPushButton:disabled{background:#eee;color:#999;}")
+        lay.addWidget(b_check)
+        def do_check():
+            b_check.setEnabled(False); b_check.setText("检查中…")
+            def on_checked(has_new, tag, url):
+                b_check.setEnabled(True); b_check.setText("🔄 立即检查更新")
+                if has_new:
+                    QMessageBox.information(dlg, "发现新版本", f"🎉 v{tag} 已发布（当前 v{APP_VERSION}）。\n请到 GitHub Releases 下载更新。")
+                elif tag:
+                    QMessageBox.information(dlg, "检查完成", f"✅ 已是最新版本（v{APP_VERSION}）。")
+                else:
+                    QMessageBox.information(dlg, "检查失败", "当前连不上 GitHub，请检查网络后重试。")
+            w = UpdateWorker(timeout=8); w.checked.connect(on_checked)
+            dlg._check_worker = w  # 防 worker 被提前回收
+            w.start()
+        b_check.clicked.connect(do_check)
+        disc = QLabel("免责声明：本工具仅供个人记账参考，不构成任何投资建议；\n行情数据或有延迟，以官方渠道为准。")
+        disc.setAlignment(Qt.AlignCenter); disc.setWordWrap(True); disc.setStyleSheet("color:#999;font-size:10px;"); lay.addWidget(disc)
+        b_close = QPushButton("关闭"); b_close.clicked.connect(dlg.accept)
+        b_close.setStyleSheet("QPushButton{padding:8px 24px;border-radius:8px;background:#f0f0f0;border:none;}QPushButton:hover{background:#e3e3e3;}")
+        lay.addWidget(b_close, 0, Qt.AlignCenter)
+        dlg.exec()
+
     def _open_pnl(self):
         self._pnl_dialog = PnlDialog(self); self._pnl_dialog.show(); self._pnl_dialog.start()
 
@@ -3070,7 +3122,7 @@ class MainWindow(QMainWindow):
             for _it in cur:
                 c, n = _it["code"], _it["name"]
                 roww = QWidget(); rl = QHBoxLayout(roww); rl.setContentsMargins(0,2,0,2)
-                lab = QLabel(f"{n}  ({c})"); lab.setFont(QFont("Microsoft YaHei",9)); rl.addWidget(lab,1)
+                lab = QLabel(f"{n}  ({c})"); lab.setFont(QFont(FONT,9)); rl.addWidget(lab,1)
                 if c in holds and ((holds[c].get("shares") or 0) or (holds[c].get("principal") or 0)):
                     warn = QLabel("⚠填过持仓"); warn.setStyleSheet("color:#b45309;font-size:8px;"); rl.addWidget(warn)
                 bb = QPushButton("移除"); bb.setStyleSheet("QPushButton{padding:4px 12px;border-radius:6px;background:#fdecea;color:#b3261e;border:1px solid #f5b7b1;}")
