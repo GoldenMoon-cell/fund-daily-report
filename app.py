@@ -13,6 +13,7 @@ import numpy as np
 import os
 import shutil
 import tempfile
+import zipfile
 from datetime import datetime, timedelta
 
 from PySide6.QtWidgets import (
@@ -101,8 +102,9 @@ NAME_MAP = {c: n for c, n in FUNDS}
 HOLD_FILE = "我的持仓.json"
 SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席=默认，不碰持仓账本
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
+SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -146,6 +148,16 @@ def load_accounts():
 
 def save_accounts(names):
     _atomic_write_json(ACCOUNTS_FILE, [{"name": n} for n in names], indent=2)
+
+def load_settings():
+    d = _load_json_with_bak(SETTINGS_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+def save_settings(d):
+    try:
+        _atomic_write_json(SETTINGS_FILE, d, indent=2)
+    except Exception:
+        pass
 
 def _migrate_holdings_if_needed(d):
     """v0.5→v0.6：旧扁平格式 {code: rec} → 新嵌套格式 {"默认": {code: rec}}。"""
@@ -1448,7 +1460,11 @@ class HoldDialog(QDialog):
         b_x = QPushButton("🔍 对账"); b_x.setToolTip("用交易流水逐笔回放，算出每只基金『应有』份额/本金，与手填值比对。\n差异行用橙底填入流水算出的值（待你核对），点保存才落盘；\n手填比流水多的基金会提示去补录流水。")
         b_x.clicked.connect(self._cross_check)
         b_x.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#e3f2fd;color:#1565c0;border:1px solid #90caf9;}QPushButton:hover{background:#bbdefb;}")
-        bar.addWidget(b_x); bar.addStretch()
+        bar.addWidget(b_x)
+        b_move = QPushButton("➡ 转移到其他账户"); b_move.setToolTip("把选中的基金持仓从当前账户转移到另一个账户。\n份额/成本/本金原样搬过去，不产生交易流水。")
+        b_move.clicked.connect(self._move_to_account)
+        b_move.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#fce4ec;color:#880e4f;border:1px solid #f8bbd0;}QPushButton:hover{background:#f8bbd0;}")
+        bar.addWidget(b_move); bar.addStretch()
         b_trade = QPushButton("📝 记一笔交易"); b_trade.clicked.connect(self._record_trade)
         b_trade.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#e8f5e9;color:#2e7d32;border:1px solid #a5d6a7;}QPushButton:hover{background:#c8e6c9;}")
         bar.addWidget(b_trade)
@@ -1523,6 +1539,76 @@ class HoldDialog(QDialog):
         if failed: parts.append(f"⚠ 没抓到净值跳过：{'、'.join(failed)}")
         self.lbl_x.setText("；".join(parts) + "。")
         self.lbl_x.show()
+
+    def _move_to_account(self):
+        """把选中基金的持仓从当前账户转移到另一个账户（立即写盘）。"""
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            cur = self.table.currentRow()
+            if cur < 0:
+                QMessageBox.information(self, "转移", "请先在表里点一下要转移的那只基金所在行。")
+                return
+            r = cur
+        else:
+            r = rows[0].row()
+        code = self.table.item(r, 1).text().strip()
+        name = self.table.item(r, 0).text().strip()
+        # 检查当前账户确实有该基金的持仓（磁盘上）
+        cur_holdings = load_holdings_for_account(self._current_account)
+        rec = cur_holdings.get(code)
+        if not rec or not ((rec.get("shares") or 0) > 0 or (rec.get("principal") or 0) > 0):
+            QMessageBox.information(self, "转移", f"「{name}」在账户『{self._current_account}』里没有已保存的持仓，无需转移。")
+            return
+        # 选择目标账户
+        others = [a for a in load_accounts() if a != self._current_account]
+        if not others:
+            QMessageBox.information(self, "转移", "只有一个账户，无法转移。\n请先点「⚙ 管理账户」新建一个账户。")
+            return
+        target, ok = QInputDialog.getItem(self, "转移到哪个账户",
+                                          f"把「{name}」从『{self._current_account}』转移到：", others, 0, False)
+        if not ok or not target:
+            return
+        # 检查目标账户是否已有同基金
+        nested = load_holdings_nested()
+        target_holdings = nested.get(target, {})
+        if code in target_holdings and ((target_holdings[code].get("shares") or 0) > 0):
+            ans = QMessageBox.question(self, "目标已有该基金",
+                f"账户『{target}』里已经有「{name}」的持仓。\n转移将合并两边份额/本金，是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
+            # 合并
+            t_rec = target_holdings[code]
+            m_sh = float(t_rec.get("shares") or 0) + float(rec.get("shares") or 0)
+            m_prin = float(t_rec.get("principal") or 0) + float(rec.get("principal") or 0)
+            bd_t = (t_rec.get("buy_date") or "").strip(); bd_r = (rec.get("buy_date") or "").strip()
+            m_bd = min(x for x in [bd_t, bd_r] if x) if (bd_t or bd_r) else ""
+            target_holdings[code] = {"shares": round(m_sh, 4),
+                                     "cost": round(m_prin / m_sh, 4) if m_sh > 0 else 0.0,
+                                     "principal": round(m_prin, 2), "buy_date": m_bd}
+        else:
+            target_holdings[code] = rec
+        nested[target] = target_holdings
+        # 从源账户删除
+        nested[self._current_account].pop(code, None)
+        save_holdings_nested(nested)
+        # 同步交易流水的账户标记
+        all_t = load_trades(); changed = False
+        for t in all_t:
+            if t.get("code") == code and (t.get("account") or DEFAULT_ACCOUNT) == self._current_account:
+                t["account"] = target; changed = True
+        if changed:
+            save_trades(all_t)
+        # 清空当前表格该行（避免后续保存写回）
+        self._busy = True
+        try:
+            for cc in (2, 3, 4, 5):
+                self.table.setItem(r, cc, QTableWidgetItem(""))
+        finally:
+            self._busy = False
+        QMessageBox.information(self, "转移完成",
+            f"✅ 「{name}」已从『{self._current_account}』转移到『{target}』。\n"
+            f"交易流水已同步归属新账户。\n注意：转移立即生效，其余单元格的未保存修改仍需点「💾保存」。")
 
     def _record_trade(self):
         rows = self.table.selectionModel().selectedRows()
@@ -2131,10 +2217,15 @@ class PnlDialog(QDialog):
         trades_by = {}
         for t in filtered:
             trades_by.setdefault(t["code"], []).append(t)
-        hold = load_holdings()
+        # 兑底持仓也按账户筛选（无交易记录的基金用当前份额近似）
+        if self._account_filter != "__all__":
+            self._hold_fb = load_holdings_for_account(self._account_filter)
+        else:
+            self._hold_fb = load_holdings()
+        hold = self._hold_fb
         codes = []
         for c, _n in FUNDS:
-            sh = float(self.parent().resolved.get(c, {}).get("shares") or 0)
+            sh = float(hold.get(c, {}).get("shares") or 0)
             bd = (hold.get(c) or {}).get("buy_date", "")
             if trades_by.get(c) or sh > 0 or bd:
                 codes.append(c)
@@ -2176,6 +2267,11 @@ class PnlDialog(QDialog):
 
     def _on_filter_changed(self):
         self._account_filter = self._acc_filter.currentData()
+        # 刷新兑底持仓
+        if self._account_filter != "__all__":
+            self._hold_fb = load_holdings_for_account(self._account_filter)
+        else:
+            self._hold_fb = load_holdings()
         if self._hist:
             self._build_timeline()
             self._refresh_month(); self._update_overview()
@@ -2210,14 +2306,14 @@ class PnlDialog(QDialog):
                     pts.append((t["date"], max(shares, 0.0)))
                 if pts: self._tl[code] = pts
                 continue
-            rec = self.parent().resolved.get(code, {})
-            sh = float(rec.get("shares") or 0); bd = (load_holdings().get(code, {}) or {}).get("buy_date", "")
+            rec = self._hold_fb.get(code, {})
+            sh = float(rec.get("shares") or 0); bd = (rec.get("buy_date") or "")
             if sh > 0 and bd: self._tl[code] = [(bd, sh)]
 
     def _shares_on(self, code, ds):
         if getattr(self, "_start", "") and ds < self._start: return 0.0
         tl = self._tl.get(code)
-        if not tl: return float(self.parent().resolved.get(code, {}).get("shares") or 0)
+        if not tl: return float(getattr(self, "_hold_fb", {}).get(code, {}).get("shares") or 0)
         sh = 0.0
         for d, s in tl:
             if d <= ds: sh = s
@@ -2644,6 +2740,10 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self._open_export); top.addWidget(self.btn_export)
         self.btn_export.setFont(QFont("Microsoft YaHei",9))
         self.btn_export.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#ecfeff;color:#0891b2;border:none;}QPushButton:hover{background:#cffafe;}")
+        self.btn_backup = QPushButton("🗄 备份")
+        self.btn_backup.clicked.connect(self._open_backup); top.addWidget(self.btn_backup)
+        self.btn_backup.setFont(QFont("Microsoft YaHei",9))
+        self.btn_backup.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#fef3c7;color:#92400e;border:none;}QPushButton:hover{background:#fde68a;}")
         # 「📸 最新快照」按钮已随 OCR 一并移除
         self.btn_refresh = QPushButton("🔄  刷新数据"); self.btn_refresh.setFont(QFont("Microsoft YaHei",10))
         self.btn_refresh.setStyleSheet("QPushButton{padding:9px 16px;border-radius:8px;background:#2563eb;color:#fff;border:none;}QPushButton:hover{background:#1d4ed8;}QPushButton:disabled{background:#bbb;}")
@@ -2845,6 +2945,55 @@ class MainWindow(QMainWindow):
 
     def _open_export(self):
         ExportDialog(self).exec()
+
+    def _open_backup(self):
+        """一键备份：把 5 个数据 json 打包成 zip。支持记住默认目录。"""
+        files = [EXTRA_FILE, HOLD_FILE, TRADES_FILE, SHOW_FILE, ACCOUNTS_FILE, SETTINGS_FILE]
+        existing = [f for f in files if os.path.exists(f)]
+        if not existing:
+            QMessageBox.information(self, "备份", "还没有任何数据文件，无需备份。")
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"基金日报备份_{ts}.zip"
+        settings = load_settings()
+        backup_dir = settings.get("backup_dir", "")
+        used_default = False
+        if backup_dir and os.path.isdir(backup_dir):
+            save_path = os.path.join(backup_dir, default_name)
+            used_default = True
+        else:
+            save_path, _ = QFileDialog.getSaveFileName(self, "选择备份保存位置", default_name, "ZIP 压缩包 (*.zip)")
+            if not save_path:
+                return
+        try:
+            with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for f in existing:
+                    zf.write(f, os.path.basename(f))
+        except Exception as e:
+            QMessageBox.warning(self, "备份失败", f"写入失败：{e}")
+            return
+        if used_default:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("备份成功")
+            msg.setIcon(QMessageBox.Information)
+            msg.setText(f"✅ 已备份到：\n{save_path}\n\n（已存到你设置的默认目录）")
+            b_change = msg.addButton("更换默认目录", QMessageBox.ActionRole)
+            msg.addButton("好的", QMessageBox.AcceptRole)
+            msg.exec()
+            if msg.clickedButton() is b_change:
+                new_dir = QFileDialog.getExistingDirectory(self, "选择新的默认备份目录", backup_dir)
+                if new_dir:
+                    settings["backup_dir"] = new_dir; save_settings(settings)
+        else:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("备份成功")
+            msg.setIcon(QMessageBox.Information)
+            msg.setText(f"✅ 已备份到：\n{save_path}")
+            b_remember = msg.addButton("记住这个位置", QMessageBox.ActionRole)
+            msg.addButton("就这一次", QMessageBox.AcceptRole)
+            msg.exec()
+            if msg.clickedButton() is b_remember:
+                settings["backup_dir"] = os.path.dirname(save_path); save_settings(settings)
 
     def _open_pnl(self):
         self._pnl_dialog = PnlDialog(self); self._pnl_dialog.show(); self._pnl_dialog.start()
