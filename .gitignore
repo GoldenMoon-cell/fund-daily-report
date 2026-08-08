@@ -12,11 +12,13 @@ dist/
 trades.json
 自定义基金.json
 基金显示.json
+账户.json
 snapshots/
 screenshots/
 ocr_out.txt
 run.log
 我的基金.txt
+_selfcheck_*.py
 
 # v0.3 导出 Excel(默认存app目录,内含持仓/交易隐私数据)
 *.xlsx
