@@ -113,7 +113,7 @@ SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
 SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -2849,11 +2849,17 @@ class MainWindow(QMainWindow):
         sl = QHBoxLayout(self.summary); sl.setContentsMargins(16,12,16,12)
         self.lbl_total = QLabel("总持仓市值  —"); self.lbl_total.setFont(QFont(FONT,11,QFont.Bold))
         self.lbl_today = QLabel("今日盈亏  —"); self.lbl_today.setFont(QFont(FONT,11,QFont.Bold))
-        sl.addWidget(self.lbl_total); sl.addStretch(); sl.addWidget(self.lbl_today); outer.addWidget(self.summary)
+        self.lbl_cum = QLabel("累计收益  —"); self.lbl_cum.setFont(QFont(FONT,11,QFont.Bold))  # v1.2：总市值-总本金
+        sl.addWidget(self.lbl_total); sl.addStretch(); sl.addWidget(self.lbl_today)
+        _sep = QLabel("｜"); _sep.setStyleSheet("color:#ccc;"); sl.addWidget(_sep)
+        sl.addWidget(self.lbl_cum); outer.addWidget(self.summary)
         self.lbl_fix = QLabel(""); self.lbl_fix.setStyleSheet("QLabel{color:#9a6b00;background:#fff7d6;border:1px solid #f0d97a;border-radius:8px;padding:8px 12px;}")
         self.lbl_fix.setWordWrap(True); self.lbl_fix.hide(); outer.addWidget(self.lbl_fix)
         self.lbl_alert = QLabel(""); self.lbl_alert.setStyleSheet("QLabel{color:#b3261e;background:#fdecea;border:1px solid #f5b7b1;border-radius:8px;padding:8px 12px;}")
         self.lbl_alert.setWordWrap(True); self.lbl_alert.hide(); outer.addWidget(self.lbl_alert)
+        self.lbl_noacc = QLabel("")  # v1.2：无持仓账户引导
+        self.lbl_noacc.setStyleSheet("QLabel{color:#1565c0;background:#e3f2fd;border:1px solid #90caf9;border-radius:8px;padding:8px 12px;font-size:12px;}")
+        self.lbl_noacc.setWordWrap(True); self.lbl_noacc.hide(); outer.addWidget(self.lbl_noacc)
         self.lbl_empty = QLabel("👋 看板还是空的：在左上方『➕ 快速添加』输入 6 位基金代码，添加第一只基金后，这里就会变成你的持仓看板。")
         self.lbl_empty.setStyleSheet("QLabel{color:#1565c0;background:#e3f2fd;border:1px solid #90caf9;border-radius:10px;padding:14px 16px;font-size:12px;}")
         self.lbl_empty.setWordWrap(True); outer.addWidget(self.lbl_empty)
@@ -2967,6 +2973,15 @@ class MainWindow(QMainWindow):
         else:
             holdings = load_holdings_for_account(account)
         self.resolved, self.corrected_codes = resolve_holdings(holdings, price_map)
+        # v1.2：无持仓账户引导横幅（只在选中具体账户时判断）
+        if hasattr(self, "lbl_noacc"):
+            if account != "__all__":
+                _has_hold = any((float((rec or {}).get("shares") or 0) > 0 or float((rec or {}).get("principal") or 0) > 0)
+                                for rec in holdings.values() if isinstance(rec, dict))
+                self.lbl_noacc.setText(f"👛 「{account}」账户还没有持仓：点「💼 管理持仓」切到该账户填写份额/成本，盈亏统计才会生效。")
+                self.lbl_noacc.setVisible(not _has_hold)
+            else:
+                self.lbl_noacc.hide()
         self._cleared_codes = load_show_state()
         act = [d for d in self.last_results if d["code"] not in self._cleared_codes]
         for d in act:
@@ -3017,7 +3032,7 @@ class MainWindow(QMainWindow):
             self.lbl_alert.hide()
 
     def _update_summary(self, results):
-        total_mv=0.0; today_pnl=0.0; has=False
+        total_mv=0.0; today_pnl=0.0; total_prin=0.0; has=False
         clr = getattr(self, "_cleared_codes", set()) or set()
         results = [d for d in results if d["code"] not in clr]
         for d in results:
@@ -3026,6 +3041,8 @@ class MainWindow(QMainWindow):
                 cost=float(r2.get("cost") or 0); sh=float(r2["shares"])
                 if cost > 0:
                     mv=nav*sh; total_mv+=mv; today_pnl += mv*(chg/(100+chg)) if (100+chg) else 0; has=True
+                    prin=float(r2.get("principal") or 0)  # v1.2：本金缺失时用 成本×份额 兑底
+                    total_prin += prin if prin > 0 else cost*sh
         if has:
             self.lbl_total.setText(f"总持仓市值  ¥{total_mv:,.2f}"); self.lbl_total.setStyleSheet("color:#222;")
             pc=RED if today_pnl>=0 else GREEN
@@ -3033,9 +3050,14 @@ class MainWindow(QMainWindow):
             _nd = max(_nds) if _nds else ""
             _tag = "今日盈亏" if (_nd == datetime.now().strftime("%Y-%m-%d")) else (f"盈亏(截至{_nd[5:]})" if _nd else "今日盈亏")
             self.lbl_today.setText(f"{_tag}  {today_pnl:+,.2f}元"); self.lbl_today.setStyleSheet(f"color:{pc};")
+            cum = total_mv - total_prin  # v1.2：累计收益 = 总市值 - 总本金
+            cpc = RED if cum >= 0 else GREEN
+            pct = (cum/total_prin*100) if total_prin > 0 else 0.0
+            self.lbl_cum.setText(f"累计收益  {cum:+,.2f}元 ({pct:+.2f}%)"); self.lbl_cum.setStyleSheet(f"color:{cpc};")
         else:
             # 无手填持仓 → 显示平均涨跌（OCR 快照回退已移除）
             self.lbl_total.setText("总持仓市值  未填持仓"); self.lbl_total.setStyleSheet("color:#999;font-size:12px;")
+            self.lbl_cum.setText("累计收益  —"); self.lbl_cum.setStyleSheet("color:#999;")
             chgs=[d.get("chg",0) for d in results if d.get("status")=="ok"]
             if chgs:
                 avg=sum(chgs)/len(chgs); pc=RED if avg>=0 else GREEN
