@@ -6,6 +6,7 @@
 import sys
 import json
 import urllib.request
+import urllib.parse
 import re
 import ssl
 import traceback
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QAbstractItemView, QButtonGroup, QGraphicsOpacityEffect,
     QComboBox, QLineEdit, QFileDialog, QSplitter, QCheckBox,
     QRadioButton, QFormLayout, QDateEdit, QGridLayout, QInputDialog,
+    QListWidget,
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, QTimer, QPropertyAnimation, QAbstractAnimation, QDate,
@@ -111,7 +113,7 @@ SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
 SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -318,8 +320,13 @@ def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
 
     # —— 同步流水到 trades.json（收益日历时间线的唯一账本）——
     _rec = None
-    if action in ("buy", "dividend_reinvest"):
+    if action == "buy":
         _rec = {"side": "buy", "amount": round(float(amount), 2)}
+    elif action == "dividend_reinvest":
+        _rec = {"side": "dividend_reinvest", "amount": round(float(amount), 2),
+                "shares": round(float(amount)/float(nav), 4)}
+    elif action == "dividend_cash":
+        _rec = {"side": "dividend_cash", "amount": round(float(amount), 2)}
     elif action in ("sell", "convert"):
         _rec = {"side": "sell", "amount": round(float(shares) * float(nav), 2)}
     if _rec is not None:
@@ -413,6 +420,25 @@ def fetch_one(code):
     except Exception as e:
         last_err += f" | 通道2异常:{e}"
     return {"code": code, "name": "", "nav": 0, "est": 0, "chg": 0, "status": "fail", "err": last_err.strip(" |")}
+
+
+def search_funds(key):
+    """按名字/代码模糊搜基金（东财 suggest），返回 [(code, name)]；网络/解析失败返回 []。"""
+    key = (key or "").strip()
+    if not key: return []
+    try:
+        u = "https://fundsuggest.eastmoney.com/FundSearch/api/FundSearchAPI.ashx?m=1&key=" + urllib.parse.quote(key)
+        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://fund.eastmoney.com/"})
+        with urllib.request.urlopen(req, timeout=8, context=_SSL) as r:
+            j = json.loads(r.read().decode("utf-8", "ignore"))
+        out = []
+        for d in (j.get("Datas") or []):
+            c = str(d.get("CODE") or "").strip(); n = str(d.get("NAME") or "").strip()
+            if re.search(r"^\d{6}$", c) and n and (c, n) not in out:
+                out.append((c, n))
+        return out
+    except Exception:
+        return []
 
 
 def fetch_history(code):
@@ -711,6 +737,15 @@ class UpdateWorker(QThread):
             t.append(int(n) if n else 0)
         while len(t) < 3: t.append(0)
         return tuple(t[:3])
+
+
+class SearchWorker(QThread):
+    """v1.1：名字搜索走后台线程，网络等待不冻界面（耗时操作走子线程铁律）。"""
+    done = Signal(list)
+    def __init__(self, key):
+        super().__init__(); self.key = key
+    def run(self):
+        self.done.emit(search_funds(self.key))
 
 
 class DateAxis(pg.AxisItem):
@@ -1676,6 +1711,8 @@ class HoldDialog(QDialog):
                 QMessageBox.warning(self, "转换", f"没抓到转入基金 {date} 的净值，请直接填【转入份额】（支付宝交易详情里有）。")
                 return
             if to_share <= 0: to_share = conv_amt / to_nav
+        if act == "dividend_reinvest" and nav <= 0 and shares > 0 and amount > 0:
+            nav = amount / shares
         try:
             if act == "convert":
                 snap = apply_trade(draft, code, "convert", nav=nav, shares=src_sh, date=date,
@@ -1793,7 +1830,10 @@ class HoldDialog(QDialog):
                 it = list_box.takeAt(0); w = it.widget()
                 if w: w.deleteLater()
             for a in load_accounts():
-                row = QHBoxLayout()
+                # 每行套一个 QWidget：否则旧行 takeAt 时 widget() 为 None，
+                # 旧行控件删不掉变幽灵行（v1.1 修复：重复显示/删后残留）
+                roww = QWidget()
+                row = QHBoxLayout(roww); row.setContentsMargins(0,2,0,2)
                 lb = QLabel(a); lb.setFont(QFont(FONT, 10))
                 row.addWidget(lb, 1)
                 if a != DEFAULT_ACCOUNT:
@@ -1803,7 +1843,7 @@ class HoldDialog(QDialog):
                     btn_del.setStyleSheet("color:#b3261e;")
                     btn_del.clicked.connect(lambda _, x=a: do_delete(x))
                     row.addWidget(btn_rename); row.addWidget(btn_del)
-                list_box.addLayout(row)
+                list_box.addWidget(roww)
         def do_rename(old):
             new, ok = QInputDialog.getText(dlg, "改名", "新账户名：", text=old)
             if not ok or not new.strip() or new.strip() == old:
@@ -1834,6 +1874,15 @@ class HoldDialog(QDialog):
                 return
             accs = load_accounts(); accs.remove(name); save_accounts(accs)
             nested = load_holdings_nested(); nested.pop(name, None); save_holdings_nested(nested)
+            # 删掉的恰好是当前选中账户：切到第一个账户并重载表格（v1.1 修复）
+            if self._current_account == name:
+                new_cur = accs[0] if accs else DEFAULT_ACCOUNT
+                self._acc_combo.blockSignals(True)
+                idx = self._acc_combo.findText(new_cur)
+                if idx >= 0: self._acc_combo.setCurrentIndex(idx)
+                self._acc_combo.blockSignals(False)
+                self._current_account = new_cur
+                self._load_for_account()
             rebuild()
         add_bar = QHBoxLayout()
         ed_new = QLineEdit(); ed_new.setPlaceholderText("新账户名称")
@@ -1970,12 +2019,12 @@ class TradeDialog(QDialog):
     def __init__(self, parent, name, code, kind):
         super().__init__(parent)
         self.setWindowTitle("记一笔 - " + name)
-        self.resize(470, 340)
+        self.resize(560, 360)
         self._code = code
         self._price = getattr(parent, "_price", {})
         L = QVBoxLayout(self); L.setSpacing(8)
 
-        tip = QLabel("口径：15:00 前提交按【当天】净值确认，15:00 后/节假日按【下一交易日】净值确认。\n补录历史交易：日期填确认净值对应的交易日，净值/份额照抄支付宝交易详情即可。")
+        tip = QLabel("口径：15:00 前提交按【当天】净值确认，15:00 后/节假日按【下一交易日】净值确认。\n补录历史交易：日期填确认净值对应的交易日，净值/份额照抄支付宝交易详情即可。\n分红：现金分红只记金额（计入当日收益）；红利再投记金额+份额（份额并入持仓）。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#888; font-size:11px;")
         L.addWidget(tip)
@@ -1984,8 +2033,12 @@ class TradeDialog(QDialog):
         self.rb_buy = QRadioButton("买入")
         self.rb_sell = QRadioButton("卖出")
         self.rb_conv = QRadioButton("转换")
+        self.rb_divc = QRadioButton("现金分红")
+        self.rb_divr = QRadioButton("红利再投")
         (self.rb_buy if kind == "buy" else self.rb_sell).setChecked(True)
-        H.addWidget(self.rb_buy); H.addWidget(self.rb_sell); H.addWidget(self.rb_conv); H.addStretch()
+        for _rb in (self.rb_buy, self.rb_sell, self.rb_conv, self.rb_divc, self.rb_divr):
+            H.addWidget(_rb)
+        H.addStretch()
         L.addLayout(H)
 
         F = QFormLayout(); F.setLabelAlignment(Qt.AlignRight)
@@ -2072,30 +2125,42 @@ class TradeDialog(QDialog):
         self.lbl_hint.setText(txt)
         self.lbl_hint.show()
 
+    def _kind(self):
+        if self.rb_conv.isChecked(): return "convert"
+        if self.rb_divc.isChecked(): return "dividend_cash"
+        if self.rb_divr.isChecked(): return "dividend_reinvest"
+        return "buy" if self.rb_buy.isChecked() else "sell"
+
     def _try_accept(self):
+        kind = self._kind()
         try: price = float(self.ed_price.text())
         except ValueError: price = 0
-        if price <= 0:
-            QMessageBox.warning(self, "提示", "成交净值必须大于 0。\n补录历史交易请填该笔的确认净值，不要用今天的净值。")
-            return
         try: amount = float(self.ed_amt.text() or 0)
         except ValueError:
-            QMessageBox.warning(self, "提示", "金额必须是数字。")
-            return
+            QMessageBox.warning(self, "提示", "金额必须是数字。"); return
         try: share = float(self.ed_share.text() or 0)
         except ValueError:
-            QMessageBox.warning(self, "提示", "份额必须是数字。")
-            return
+            QMessageBox.warning(self, "提示", "份额必须是数字。"); return
         if amount < 0 or share < 0:
-            QMessageBox.warning(self, "提示", "金额/份额不能为负数。")
-            return
+            QMessageBox.warning(self, "提示", "金额/份额不能为负数。"); return
+        if kind == "dividend_cash":
+            if amount <= 0:
+                QMessageBox.warning(self, "提示", "现金分红请填【金额】（到账的分红钱）。"); return
+            self.accept(); return
+        if kind == "dividend_reinvest":
+            if amount <= 0:
+                QMessageBox.warning(self, "提示", "红利再投请填【金额】。"); return
+            if price <= 0 and share <= 0:
+                QMessageBox.warning(self, "提示", "红利再投需要【成交净值】或【份额】之一，用来算再投份额。"); return
+            self.accept(); return
+        if price <= 0:
+            QMessageBox.warning(self, "提示", "成交净值必须大于 0。\n补录历史交易请填该笔的确认净值，不要用今天的净值。"); return
         if amount <= 0 and share <= 0:
-            QMessageBox.warning(self, "提示", "【金额】和【份额】至少填一个：买入填金额，卖出可只填份额。")
-            return
+            QMessageBox.warning(self, "提示", "【金额】和【份额】至少填一个：买入填金额，卖出可只填份额。"); return
         self.accept()
 
     def result(self):
-        kind = "convert" if self.rb_conv.isChecked() else ("buy" if self.rb_buy.isChecked() else "sell")
+        kind = self._kind()
         date = self.ed_date.date().toString("yyyy-MM-dd")
         amount = float(self.ed_amt.text() or 0)
         share = float(self.ed_share.text() or 0)
@@ -2230,6 +2295,11 @@ class PnlDialog(QDialog):
         trades_by = {}
         for t in filtered:
             trades_by.setdefault(t["code"], []).append(t)
+        # 现金分红按日合计（v1.1 分红入账），计入日历/总览
+        self._div = {}
+        for t in filtered:
+            if t.get("side") == "dividend_cash" and t.get("date"):
+                self._div[t["date"]] = self._div.get(t["date"], 0.0) + float(t.get("amount") or 0)
         # 兑底持仓也按账户筛选（无交易记录的基金用当前份额近似）
         if self._account_filter != "__all__":
             self._hold_fb = load_holdings_for_account(self._account_filter)
@@ -2268,6 +2338,8 @@ class PnlDialog(QDialog):
                 prev = m[ds]
             self._per[code] = per; self._pnav[code] = pnav
         self._days = sorted(set().union(*[set(p) for p in self._per.values()])) if self._per else []
+        if getattr(self, "_div", None):
+            self._days = sorted(set(self._days) | set(self._div))
         self._build_timeline()
         if not self._days:
             self.lbl_status.setText("⚠ 没抓到任何历史净值。"); return
@@ -2315,7 +2387,12 @@ class PnlDialog(QDialog):
                     if not amt or m[ds] <= 0:
                         pts.append((t["date"], max(shares, 0.0))); continue
                     dsh = amt/m[ds]
-                    shares += dsh if t["side"] == "buy" else -dsh
+                    if t["side"] in ("buy", "dividend_reinvest"):
+                        shares += dsh
+                    elif t["side"] in ("sell", "convert"):
+                        shares -= dsh
+                    else:
+                        continue   # dividend_cash 等：份额不变，不产生时间点
                     pts.append((t["date"], max(shares, 0.0)))
                 if pts: self._tl[code] = pts
                 continue
@@ -2339,6 +2416,7 @@ class PnlDialog(QDialog):
             if ds not in per: continue
             sh = self._shares_on(code, ds); pn = self._pnav[code].get(ds)
             if sh and pn: tot += sh*pn*per[ds]/100
+        tot += getattr(self, "_div", {}).get(ds, 0.0)   # 现金分红当日计入
         return tot
 
     def _set_ov(self, key, val, pct=False):
@@ -2409,15 +2487,17 @@ class PnlDialog(QDialog):
             sh = self._shares_on(code, ds); pn = self._pnav[code].get(ds)
             if not (sh and pn): continue
             rows.append((NAME_MAP.get(code, code), sh*pn*per[ds]/100, per[ds]))
+        div = getattr(self, "_div", {}).get(ds, 0.0)
+        if div: rows.append(("现金分红", div, None))
         if not rows:
             self.lbl_day.setText(f"{ds} 休市 / 无持仓"); self.tbl.setRowCount(0); return
         rows.sort(key=lambda x: -x[1]); tot = sum(x[1] for x in rows)
-        self.lbl_day.setText(f"{ds} 合计 {tot:+,.2f} 元 （{len(rows)} 只有数据）")
+        self.lbl_day.setText(f"{ds} 合计 {tot:+,.2f} 元 （{len(rows)} 条数据）")
         self.tbl.setRowCount(len(rows))
         for r, (nm, pnl, pct) in enumerate(rows):
             self.tbl.setItem(r,0,QTableWidgetItem(nm))
             it = QTableWidgetItem(f"{pnl:+,.2f}"); it.setForeground(QColor(RED if pnl>=0 else GREEN)); self.tbl.setItem(r,1,it)
-            it = QTableWidgetItem(f"{pct:+.2f}%"); it.setForeground(QColor(RED if pct>=0 else GREEN)); self.tbl.setItem(r,2,it)
+            it = QTableWidgetItem(f"{pct:+.2f}%" if pct is not None else ""); it.setForeground(QColor(RED if (pct or 0)>=0 else GREEN)); self.tbl.setItem(r,2,it)
             self.tbl.setItem(r,3,QTableWidgetItem(""))
 
 class TradesDialog(QDialog):
@@ -2784,9 +2864,12 @@ class MainWindow(QMainWindow):
         add_box = QFrame(); add_box.setStyleSheet("QFrame{background:#fff;border:1px solid #eee;border-radius:10px;}")
         abl = QHBoxLayout(add_box); abl.setContentsMargins(12,10,12,10)
         atitle = QLabel("➕ 快速添加"); atitle.setFont(QFont(FONT,9,QFont.Bold)); abl.addWidget(atitle)
-        self._add_input = QLineEdit(); self._add_input.setPlaceholderText("6位代码 如 000001"); self._add_input.setFont(QFont(FONT,9))
+        self._add_input = QLineEdit(); self._add_input.setPlaceholderText("6位代码 或 点🔍搜名字"); self._add_input.setFont(QFont(FONT,9))
         self._add_input.setFixedWidth(150); self._add_input.setStyleSheet("QLineEdit{padding:6px 8px;border:1px solid #ddd;border-radius:7px;}")
         abl.addWidget(self._add_input)
+        self._search_btn = QPushButton("🔍 搜名字"); self._search_btn.setFont(QFont(FONT,9))
+        self._search_btn.setStyleSheet("QPushButton{padding:6px 12px;border-radius:7px;background:#eef2ff;color:#4f46e5;border:none;}QPushButton:hover{background:#e0e7ff;}")
+        self._search_btn.clicked.connect(self._search_pick); abl.addWidget(self._search_btn)
         self._add_btn = QPushButton("添加"); self._add_btn.setFont(QFont(FONT,9))
         self._add_btn.setStyleSheet("QPushButton{padding:6px 14px;border-radius:7px;background:#2563eb;color:#fff;border:none;}QPushButton:hover{background:#1d4ed8;}QPushButton:disabled{background:#bbb;}")
         self._add_btn.clicked.connect(self._add_fund); abl.addWidget(self._add_btn)
@@ -3050,6 +3133,19 @@ class MainWindow(QMainWindow):
     def _open_pnl(self):
         self._pnl_dialog = PnlDialog(self); self._pnl_dialog.show(); self._pnl_dialog.start()
 
+    def _refresh_account_combo(self):
+        """重新填充主页账户下拉框（管理账户增删改后调用，免重启，v1.1 新增）。"""
+        if not hasattr(self, "_account_combo"): return
+        cur = self._account_combo.currentData()
+        self._account_combo.blockSignals(True)
+        self._account_combo.clear()
+        self._account_combo.addItem("全部账户", "__all__")
+        for a in load_accounts():
+            self._account_combo.addItem(a, a)
+        idx = self._account_combo.findData(cur)
+        self._account_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._account_combo.blockSignals(False)
+
     def _open_hold(self):
         price_map = {d["code"]: d.get("nav",0) for d in self.last_results if d.get("status")=="ok"}
         account = self._account_combo.currentData() if hasattr(self, '_account_combo') else "__all__"
@@ -3058,7 +3154,10 @@ class MainWindow(QMainWindow):
         holdings = load_holdings_for_account(account)
         resolved, corrected = resolve_holdings(holdings, price_map)
         dlg = HoldDialog(resolved, corrected, price_map, self, account)
-        dlg.finished.connect(lambda _: self._refresh_home() if dlg.saved else None)
+        def _after(_):
+            self._refresh_account_combo()  # 无论是否保存，账户结构可能已变
+            if dlg.saved: self._refresh_home()
+        dlg.finished.connect(_after)
         dlg.exec()
 
     def _on_account_changed(self):
@@ -3071,6 +3170,42 @@ class MainWindow(QMainWindow):
     def _redraw_aggregates(self):
         self.chart.draw([(d.get("name",d["code"])[:8], d.get("chg",0)) for d in self.last_results], animate=False)
         self._update_board(self.last_results); self._update_summary(self.last_results); self._update_alert(self.last_results)
+
+    def _search_pick(self):
+        d = QDialog(self); d.setWindowTitle("🔍 搜基金名字"); d.resize(460, 420)
+        lay = QVBoxLayout(d)
+        row = QHBoxLayout()
+        ed = QLineEdit(); ed.setPlaceholderText("输入基金名字/代码，如 广发纳指 / 006479"); ed.setFont(QFont(FONT,9))
+        ed.setText(self._add_input.text().strip())
+        row.addWidget(ed, 1)
+        b_go = QPushButton("搜索"); b_go.setStyleSheet("QPushButton{padding:6px 14px;border-radius:7px;background:#2563eb;color:#fff;border:none;}")
+        row.addWidget(b_go); lay.addLayout(row)
+        lst = QListWidget(); lst.setFont(QFont(FONT,9)); lay.addWidget(lst, 1)
+        lbl = QLabel("双击某一行即可添加到看板。"); lbl.setStyleSheet("color:#888;font-size:10px;"); lay.addWidget(lbl)
+        def do_search():
+            lst.clear(); lst.addItem("⏳ 搜索中…")
+            b_go.setEnabled(False)
+            def on_done(res):
+                b_go.setEnabled(True)
+                lst.clear()
+                if not res:
+                    lst.addItem("（没搜到，或网络不通。可改输 6 位代码直接添加。）"); return
+                for c, n in res:
+                    lst.addItem(f"{n}（{c}）")
+            w = SearchWorker(ed.text()); w.done.connect(on_done)
+            d._worker = w  # 防 worker 被提前回收
+            w.start()
+        b_go.clicked.connect(do_search)
+        def pick(item, *_):
+            txt = item.text()
+            m = re.search(r"（(\d{6})）", txt)
+            if not m: return
+            self._add_input.setText(m.group(1))
+            d.accept()
+        lst.itemDoubleClicked.connect(pick)
+        d.exec()
+        if d.result() == QDialog.Accepted:
+            self._add_fund()
 
     def _add_fund(self):
         code = self._add_input.text().strip()
