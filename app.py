@@ -113,7 +113,7 @@ SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
 SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -424,6 +424,65 @@ def concentration_stats(resolved, price_map):
             "top1_pct": round(mvs[0][1] / total * 100, 1),
             "top1_name": NAME_MAP.get(mvs[0][0], mvs[0][0]),
             "top3_pct": round(sum(v for _, v in mvs[:3]) / total * 100, 1)}
+
+
+# ---------- v1.4 估值口径升级（指数基金走跟踪指数 PE/PB 百分位，行业标准口径） ----------
+INDEX_VALUATION_URL = "https://danjuanfunds.com/djapi/index_eva/dj"  # 蛋卷指数估值（非官方接口，需兜底）
+PB_FIRST_KEYWORDS = ("红利", "银行", "地产", "证券", "金融", "价值", "周期", "煤炭", "钢铁", "基建")  # 行业惯例看 PB 的指数族
+INDEX_ALIASES = [("纳斯达克100", "纳指100"), ("纳斯达克", "纳指100"), ("恒生ETF", "恒生指数")]  # 基金名写法 → 蛋卷指数名（长别名在前；用“恒生ETF”而非“恒生”，避免误伤恒生医疗等未覆盖行业指数）
+NO_VAL_KEYWORDS = {"货币": "货币", "债": "债基",
+                   "黄金": "商品", "上海金": "商品", "原油": "商品", "石油": "商品",
+                   "豆粕": "商品", "能源化工": "商品", "REIT": "商品"}  # 无估值口径的基金族
+DUAL_METRIC_INDICES = ("恒生指数",)  # 跨行业宽基需 PE+PB 结合：科技成分看 PE、金融地产成分看 PB，单一指标失真
+
+def fund_valuation_class(fund_name):
+    """v1.4：判无估值口径的基金族（债基/货币/商品）→ 标签；普通基金返回 None。
+       债基净值靠票息稳步向上、黄金原油无盈利概念，百分位信号只会误导。"""
+    if not fund_name: return None
+    for kw in ("货币", "债"):  # 先判债/货币，避免误落商品
+        if kw in fund_name: return NO_VAL_KEYWORDS[kw]
+    for kw, cls in NO_VAL_KEYWORDS.items():
+        if kw in fund_name: return cls
+    return None
+
+def fetch_index_valuation(timeout=8):
+    """v1.4：拉取蛋卷指数估值（非官方接口，可能随时变动/限流）→ {指数名: {pe, pe_pct, pb, pb_pct}}。"""
+    req = urllib.request.Request(INDEX_VALUATION_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:
+        d = json.loads(r.read().decode("utf-8", errors="ignore"))
+    out = {}
+    for it in (d.get("data") or {}).get("items") or []:
+        name = (it.get("name") or "").strip()
+        if name:
+            out[name] = {"pe": it.get("pe") or 0, "pe_pct": round((it.get("pe_percentile") or 0) * 100, 1),
+                         "pb": it.get("pb") or 0, "pb_pct": round((it.get("pb_percentile") or 0) * 100, 1)}
+    return out
+
+def match_index(fund_name, val_map):
+    """v1.4：在基金名里匹配跟踪指数名（最长优先，别名兜底）；未命中返回 None。"""
+    if not fund_name: return None
+    best = None
+    for idx in val_map:
+        if idx in fund_name and (best is None or len(idx) > len(best)):
+            best = idx
+    if best: return best
+    for alias, idx in INDEX_ALIASES:  # “纳斯达克100”→“纳指100”之类写法差异
+        if alias in fund_name and idx in val_map:
+            return idx
+    return None
+
+def pick_index_pct(idx_name, val):
+    """v1.4：红利/金融/周期族指数先看 PB 百分位，其余先看 PE 百分位；指标无效自动换另一指标。
+       跨行业宽基（DUAL_METRIC_INDICES）PE+PB 结合：返回两项均值定档，metric 为 "PE78/PB53" 双值标签。
+       返回 (百分位, 指标名)，指标都无效返回 (None, None)。"""
+    if idx_name in DUAL_METRIC_INDICES and (val.get("pe") or 0) > 0 and (val.get("pb") or 0) > 0:
+        return round((val["pe_pct"] + val["pb_pct"]) / 2, 1), f"PE{val['pe_pct']:.0f}/PB{val['pb_pct']:.0f}"
+    order = (("pb", "pb_pct"), ("pe", "pe_pct")) if any(k in idx_name for k in PB_FIRST_KEYWORDS) \
+            else (("pe", "pe_pct"), ("pb", "pb_pct"))
+    for vk, pk in order:
+        if (val.get(vk) or 0) > 0 and val.get(pk) is not None:
+            return val[pk], vk.upper()
+    return None, None
 
 
 def fetch_one(code):
@@ -790,13 +849,33 @@ class SearchWorker(QThread):
 
 
 class ValWorker(QThread):
-    """v1.3：估值红绿灯后台拉取——每只基金近 1 年净值百分位，不阻塞主线程。"""
+    """v1.3：估值信号后台拉取，不阻塞主线程。
+       v1.4 升级：指数基金用蛋卷指数 PE/PB 百分位（行业标准口径）；
+       主动/商品/未覆盖指数回退近 1 年净值百分位；接口失败全部回退。"""
     done = Signal(dict)
-    def __init__(self, nav_map):
-        super().__init__(); self.nav_map = dict(nav_map)
+    def __init__(self, nav_map, name_map=None):
+        super().__init__(); self.nav_map = dict(nav_map); self.name_map = dict(name_map or {})
     def run(self):
         from concurrent.futures import ThreadPoolExecutor
         out = {}
+        try:
+            val_map = fetch_index_valuation()
+        except Exception:
+            val_map = {}  # 非官方接口失败 → 全部回退净值百分位，不影响主流程
+        nav_todo = {}
+        for code, nav in self.nav_map.items():
+            name = self.name_map.get(code, "")
+            cls = fund_valuation_class(name)  # 债基/货币/商品无估值口径，不出信号避免误导
+            if cls:
+                out[code] = {"pct": None, "src": "na", "metric": cls}
+                continue
+            idx = match_index(name, val_map) if val_map else None
+            if idx:
+                pct, metric = pick_index_pct(idx, val_map[idx])
+                if pct is not None:
+                    out[code] = {"pct": pct, "metric": metric, "src": "index"}
+                    continue
+            nav_todo[code] = nav
         def one(code):
             try:
                 _, hist, _ = fetch_history(code)
@@ -804,9 +883,10 @@ class ValWorker(QThread):
                 return code, nav_percentile(vals, self.nav_map.get(code, 0))
             except Exception:
                 return code, None
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            for code, pct in ex.map(one, list(self.nav_map.keys())):
-                out[code] = pct
+        if nav_todo:
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                for code, pct in ex.map(one, list(nav_todo.keys())):
+                    out[code] = {"pct": pct, "metric": "净值", "src": "nav"}
         self.done.emit(out)
 
 
@@ -888,7 +968,7 @@ class FundCard(QFrame):
         self.lbl_name.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); self.lbl_name.setMinimumWidth(0)
         self.lbl_code = QLabel(code); self.lbl_code.setFont(QFont(FONT,8)); self.lbl_code.setStyleSheet("color:#999;")
         self.lbl_val = QLabel(""); self.lbl_val.setFont(QFont(FONT,8))  # v1.3 估值红绿灯
-        self.lbl_val.setToolTip("估值参考：当前净值在近 1 年净值中的百分位。≥80% 过热，≤20% 低估。仅信息展示，不构成投资建议。")
+        self.lbl_val.setToolTip("估值参考（v1.4）：指数基金看跟踪指数 PE/PB 百分位（红利/金融族看 PB）；主动基金显示近 1 年净值分位；债基/货币/商品无估值口径不显示信号。≥80% 过热，≤20% 低估。仅信息展示，不构成投资建议。")
         left.addWidget(self.lbl_name); left.addWidget(self.lbl_code); left.addWidget(self.lbl_val); lay.addLayout(left,3)
         mid = QVBoxLayout(); mid.setSpacing(2)
         self.lbl_nav = QLabel("净值 —"); self.lbl_nav.setFont(QFont(FONT,9)); self.lbl_nav.setStyleSheet("color:#666;")
@@ -928,17 +1008,26 @@ class FundCard(QFrame):
         if getattr(self, "_cleared", False): return
         self.lbl_val.setText("估值 ⏳"); self.lbl_val.setStyleSheet("color:#bbb;")
 
-    def set_val(self, pct):
-        """v1.3：估值红绿灯（近 1 年百分位）。仅信息展示不构成建议。"""
+    def set_val(self, info):
+        """v1.3/v1.4：估值信号。info={"pct":百分位, "metric":PE/PB/净值/族名, "src":index/nav/na} 或 None。"""
         if getattr(self, "_cleared", False): return
-        if pct is None:
+        if info and info.get("src") == "na":  # v1.4：债基/货币/商品无估值口径，如实标注不出信号
+            self.lbl_val.setText(f"{info.get('metric','')}·无估值口径"); self.lbl_val.setStyleSheet("color:#bbb;")
+            return
+        if not info or info.get("pct") is None:
             self.lbl_val.setText("估值 —"); self.lbl_val.setStyleSheet("color:#bbb;")
             return
+        pct = info["pct"]; m = info.get("metric") or ""
         lv = val_level(pct)
-        if lv == "hot": txt, col = f"🔴 过热 · {pct:.0f}%分位", "#e53935"
-        elif lv == "cold": txt, col = f"🟢 低估 · {pct:.0f}%分位", "#16a34a"
-        else: txt, col = f"🟡 中性 · {pct:.0f}%分位", "#b45309"
-        self.lbl_val.setText(txt); self.lbl_val.setStyleSheet(f"color:{col};")
+        if lv == "hot": lv_txt, col = "🔴 过热", "#e53935"
+        elif lv == "cold": lv_txt, col = "🟢 低估", "#16a34a"
+        else: lv_txt, col = "🟡 中性", "#b45309"
+        if "/" in m:  # PE+PB 结合指数：标签列双值，均值分位进 tooltip
+            self.lbl_val.setText(f"{lv_txt} · {m}")
+            self.lbl_val.setToolTip(f"PE+PB 结合估值（两项均值 {pct:.0f}% 分位）：指数跨科技与金融地产，单一指标会失真。仅信息展示，不构成投资建议。")
+        else:
+            self.lbl_val.setText(f"{lv_txt} · {m} {pct:.0f}%分位")
+        self.lbl_val.setStyleSheet(f"color:{col};")
 
     def update_data(self, d, resolved):
         if getattr(self, "_cleared", False): return          # 灰章状态: 行情不覆盖灰章
@@ -3049,32 +3138,33 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self,"没抓到数据","全部抓取失败，请点「🩺 诊断」。")
 
     def _start_val_worker(self, results):
-        """v1.3：估值红绿灯——当日已算过的用缓存，其余后台拉取。"""
+        """v1.3：估值信号——当日已算过的用缓存，其余后台拉取（v1.4 指数走 PE/PB）。"""
         clr = getattr(self, "_cleared_codes", set()) or set()
         nav_map = {d["code"]: d.get("nav",0) for d in results
                    if d.get("status")=="ok" and d.get("nav") and d["code"] not in clr}
         if not nav_map: return
+        name_map = {d["code"]: d.get("name","") for d in results if d["code"] in nav_map}
         today = datetime.now().strftime("%Y-%m-%d")
         if self._val_cache.get("date") != today:
             self._val_cache = {"date": today, "pct": {}}
         cache = self._val_cache["pct"]
-        for c, pct in cache.items():
+        for c, info in cache.items():
             card = self.cards.get(c)
-            if card and c in nav_map: card.set_val(pct)
+            if card and c in nav_map: card.set_val(info)
         todo = {c: n for c, n in nav_map.items() if c not in cache}
         if not todo: return
         for c in todo:
             card = self.cards.get(c)
             if card: card.set_val_loading()
-        self._val_worker = ValWorker(todo)
+        self._val_worker = ValWorker(todo, {c: name_map.get(c,"") for c in todo})
         self._val_worker.done.connect(self._on_val_done)
         self._val_worker.start()
 
-    def _on_val_done(self, pct_map):
-        self._val_cache.setdefault("pct", {}).update(pct_map)
-        for c, pct in pct_map.items():
+    def _on_val_done(self, info_map):
+        self._val_cache.setdefault("pct", {}).update(info_map)
+        for c, info in info_map.items():
             card = self.cards.get(c)
-            if card: card.set_val(pct)
+            if card: card.set_val(info)
 
     def _apply_results(self):
         price_map = {d["code"]: d.get("nav",0) for d in self.last_results if d.get("status")=="ok"}
