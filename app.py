@@ -113,7 +113,7 @@ SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
 SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -383,6 +383,47 @@ def resolve_holdings(holdings, price_map):
         if corr:
             corrected.add(code)
     return resolved, corrected
+
+
+# ---------- v1.3 参考信号（纯函数，无副作用，selfcheck 可测；仅信息展示不构成建议） ----------
+def nav_percentile(nav_list, nav):
+    """当前净值在历史净值序列中的百分位（0~100）；数据不足 60 个或净值无效返回 None。"""
+    vals = [v for v in nav_list if v and v > 0]
+    if nav is None or nav <= 0 or len(vals) < 60:
+        return None
+    below = sum(1 for v in vals if v < nav)
+    return round(below / len(vals) * 100, 1)
+
+def val_level(pct):
+    """估值分档：>=80 过热 / <=20 低估 / 其余中性；None 原样返回。"""
+    if pct is None: return None
+    if pct >= 80: return "hot"
+    if pct <= 20: return "cold"
+    return "mid"
+
+def take_profit_level(pct):
+    """累计收益率触及的止盈参考线：>=20 → 20；>=15 → 15；否则 None。"""
+    if pct is None: return None
+    if pct >= 20: return 20
+    if pct >= 15: return 15
+    return None
+
+def concentration_stats(resolved, price_map):
+    """持仓集中度：按当前市值算总市值/最大单只占比/前三大占比。无有效持仓返回 None。"""
+    mvs = []
+    for code, r in (resolved or {}).items():
+        sh = float((r or {}).get("shares") or 0)
+        nav = (price_map or {}).get(code, 0)
+        if sh > 0 and nav and nav > 0:
+            mvs.append((code, sh * float(nav)))
+    total = sum(v for _, v in mvs)
+    if total <= 0:
+        return None
+    mvs.sort(key=lambda x: -x[1])
+    return {"total": total, "n": len(mvs),
+            "top1_pct": round(mvs[0][1] / total * 100, 1),
+            "top1_name": NAME_MAP.get(mvs[0][0], mvs[0][0]),
+            "top3_pct": round(sum(v for _, v in mvs[:3]) / total * 100, 1)}
 
 
 def fetch_one(code):
@@ -748,6 +789,27 @@ class SearchWorker(QThread):
         self.done.emit(search_funds(self.key))
 
 
+class ValWorker(QThread):
+    """v1.3：估值红绿灯后台拉取——每只基金近 1 年净值百分位，不阻塞主线程。"""
+    done = Signal(dict)
+    def __init__(self, nav_map):
+        super().__init__(); self.nav_map = dict(nav_map)
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor
+        out = {}
+        def one(code):
+            try:
+                _, hist, _ = fetch_history(code)
+                vals = [nav for _ts, nav, _e in hist if nav and nav > 0][-252:]
+                return code, nav_percentile(vals, self.nav_map.get(code, 0))
+            except Exception:
+                return code, None
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for code, pct in ex.map(one, list(self.nav_map.keys())):
+                out[code] = pct
+        self.done.emit(out)
+
+
 class DateAxis(pg.AxisItem):
     def __init__(self, *a, **k):
         super().__init__(*a, **k); self._hist = []; self._fmt = "%m-%d"
@@ -825,7 +887,9 @@ class FundCard(QFrame):
         self.lbl_name = ElideLabel("—"); self.lbl_name.setFont(QFont(FONT,11,QFont.Bold))
         self.lbl_name.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); self.lbl_name.setMinimumWidth(0)
         self.lbl_code = QLabel(code); self.lbl_code.setFont(QFont(FONT,8)); self.lbl_code.setStyleSheet("color:#999;")
-        left.addWidget(self.lbl_name); left.addWidget(self.lbl_code); lay.addLayout(left,3)
+        self.lbl_val = QLabel(""); self.lbl_val.setFont(QFont(FONT,8))  # v1.3 估值红绿灯
+        self.lbl_val.setToolTip("估值参考：当前净值在近 1 年净值中的百分位。≥80% 过热，≤20% 低估。仅信息展示，不构成投资建议。")
+        left.addWidget(self.lbl_name); left.addWidget(self.lbl_code); left.addWidget(self.lbl_val); lay.addLayout(left,3)
         mid = QVBoxLayout(); mid.setSpacing(2)
         self.lbl_nav = QLabel("净值 —"); self.lbl_nav.setFont(QFont(FONT,9)); self.lbl_nav.setStyleSheet("color:#666;")
         self.lbl_nav.setMinimumWidth(0)
@@ -851,6 +915,7 @@ class FundCard(QFrame):
         if self._cleared:
             self.setStyleSheet("FundCard{background:#f6f6f6;border:1px dashed #bbb;border-radius:10px;}")
             self.lbl_chg.setText("已清仓"); self.lbl_chg.setStyleSheet("color:#999;font-size:12px;")
+            self.lbl_val.setText("")  # v1.3：灰章不显示估值信号
             self.lbl_mv.setText("仅观察·不计入总账"); self.lbl_mv.setStyleSheet("color:#aaa;")
             self.lbl_today.setText("—"); self.lbl_today.setStyleSheet("color:#bbb;")
             self.lbl_pnl.setText("持仓记录保留"); self.lbl_pnl.setStyleSheet("color:#bbb;")
@@ -858,6 +923,22 @@ class FundCard(QFrame):
         else:
             self.setStyleSheet("FundCard{background:#fff;border:1px solid #eee;border-radius:10px;}FundCard:hover{border:1px solid #bcd;}")
             self.btn_detail.setEnabled(True); self.btn_detail.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef3ff;color:#2563eb;border:none;}QPushButton:hover{background:#dbe6ff;}")
+
+    def set_val_loading(self):
+        if getattr(self, "_cleared", False): return
+        self.lbl_val.setText("估值 ⏳"); self.lbl_val.setStyleSheet("color:#bbb;")
+
+    def set_val(self, pct):
+        """v1.3：估值红绿灯（近 1 年百分位）。仅信息展示不构成建议。"""
+        if getattr(self, "_cleared", False): return
+        if pct is None:
+            self.lbl_val.setText("估值 —"); self.lbl_val.setStyleSheet("color:#bbb;")
+            return
+        lv = val_level(pct)
+        if lv == "hot": txt, col = f"🔴 过热 · {pct:.0f}%分位", "#e53935"
+        elif lv == "cold": txt, col = f"🟢 低估 · {pct:.0f}%分位", "#16a34a"
+        else: txt, col = f"🟡 中性 · {pct:.0f}%分位", "#b45309"
+        self.lbl_val.setText(txt); self.lbl_val.setStyleSheet(f"color:{col};")
 
     def update_data(self, d, resolved):
         if getattr(self, "_cleared", False): return          # 灰章状态: 行情不覆盖灰章
@@ -2785,6 +2866,7 @@ class MainWindow(QMainWindow):
         self.worker = None; self.last_results = []; self.resolved = {}; self.corrected_codes = set()
         self._cleared_codes = load_show_state()
         self._pnl_dialog = None
+        self._val_cache = {}   # v1.3 估值红绿灯缓存 {"date": 当日, "pct": {code: 百分位}}
         self._refresh_home()
         self._check_update()
 
@@ -2961,9 +3043,38 @@ class MainWindow(QMainWindow):
         self._cleared_codes = load_show_state()
         for _cd, _c in self.cards.items(): _c.set_cleared(_cd in self._cleared_codes)
         self._apply_results(); self._fade_cards()
+        self._start_val_worker(results)  # v1.3：估值红绿灯后台拉取
         self.btn_refresh.setEnabled(True); self.btn_refresh.setText("🔄  刷新数据")
         if sum(1 for r in results if r.get("status")=="ok") == 0:
             QMessageBox.warning(self,"没抓到数据","全部抓取失败，请点「🩺 诊断」。")
+
+    def _start_val_worker(self, results):
+        """v1.3：估值红绿灯——当日已算过的用缓存，其余后台拉取。"""
+        clr = getattr(self, "_cleared_codes", set()) or set()
+        nav_map = {d["code"]: d.get("nav",0) for d in results
+                   if d.get("status")=="ok" and d.get("nav") and d["code"] not in clr}
+        if not nav_map: return
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._val_cache.get("date") != today:
+            self._val_cache = {"date": today, "pct": {}}
+        cache = self._val_cache["pct"]
+        for c, pct in cache.items():
+            card = self.cards.get(c)
+            if card and c in nav_map: card.set_val(pct)
+        todo = {c: n for c, n in nav_map.items() if c not in cache}
+        if not todo: return
+        for c in todo:
+            card = self.cards.get(c)
+            if card: card.set_val_loading()
+        self._val_worker = ValWorker(todo)
+        self._val_worker.done.connect(self._on_val_done)
+        self._val_worker.start()
+
+    def _on_val_done(self, pct_map):
+        self._val_cache.setdefault("pct", {}).update(pct_map)
+        for c, pct in pct_map.items():
+            card = self.cards.get(c)
+            if card: card.set_val(pct)
 
     def _apply_results(self):
         price_map = {d["code"]: d.get("nav",0) for d in self.last_results if d.get("status")=="ok"}
@@ -3026,6 +3137,9 @@ class MainWindow(QMainWindow):
                     pct = (nav-cost)/cost*100
                     if pct <= -15:
                         alerts.append(f"🕳 {name[:8]} 已深套 {pct:.0f}%")
+                    tp = take_profit_level(pct)  # v1.3：止盈参考线提醒
+                    if tp:
+                        alerts.append(f"🎯 {name[:8]} 累计 +{pct:.0f}%，触及 {tp}% 止盈参考线")
         if alerts:
             self.lbl_alert.setText("  ｜  ".join(alerts[:4])); self.lbl_alert.show()
         else:
@@ -3324,6 +3438,16 @@ class MainWindow(QMainWindow):
                 lines.append(f"[OK]   {r['code']} {r.get('name','')[:14]:14s} 净值{r['nav']:.4f} 涨跌{r['chg']:+.2f}%  via={r.get('via')}")
             else:
                 lines.append(f"[FAIL] {r['code']} {r.get('name','')[:14]:14s}  -> {r.get('err','未知')}")
+        # v1.3：持仓集中度（按当前市值，仅信息展示）
+        pm = {r["code"]: r.get("nav",0) for r in self.last_results if r.get("status")=="ok"}
+        cs = concentration_stats(self.resolved, pm)
+        if cs:
+            lines += ["-"*50, "持仓结构（按当前市值）",
+                      f"持有 {cs['n']} 只基金，总市值 ¥{cs['total']:,.2f}",
+                      f"最大单只：{cs['top1_name'][:12]}，占比 {cs['top1_pct']:.1f}%",
+                      f"前三大占比：{cs['top3_pct']:.1f}%" + ("  ⚠ 偏集中（参考阈值 60%）" if cs['top3_pct'] >= 60 else "")]
+        else:
+            lines += ["-"*50, "持仓结构：暂无有效持仓（未填份额或无行情）"]
         te.setPlainText("\n".join(lines)); lay.addWidget(te)
         b = QPushButton("关闭"); b.clicked.connect(d.accept); lay.addWidget(b); d.exec()
 
