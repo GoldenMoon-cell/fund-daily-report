@@ -113,7 +113,7 @@ SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
 SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -455,7 +455,8 @@ def fetch_index_valuation(timeout=8):
         name = (it.get("name") or "").strip()
         if name:
             out[name] = {"pe": it.get("pe") or 0, "pe_pct": round((it.get("pe_percentile") or 0) * 100, 1),
-                         "pb": it.get("pb") or 0, "pb_pct": round((it.get("pb_percentile") or 0) * 100, 1)}
+                         "pb": it.get("pb") or 0, "pb_pct": round((it.get("pb_percentile") or 0) * 100, 1),
+                         "yield_pct": round((it.get("yeild") or 0) * 100, 2)}  # v1.5：股息率（上游字段名 yeild 是 typo，照原样读）
     return out
 
 def match_index(fund_name, val_map):
@@ -483,6 +484,50 @@ def pick_index_pct(idx_name, val):
         if (val.get(vk) or 0) > 0 and val.get(pk) is not None:
             return val[pk], vk.upper()
     return None, None
+
+
+# ---------- v1.5 估值深化（信号文本/详情文本/卡片排序，纯函数可测） ----------
+def val_signal_text(info):
+    """v1.5：卡片估值信号行文本。指数源带股息率；无效返回 None。"""
+    if not info or info.get("pct") is None: return None
+    lv = val_level(info["pct"])
+    lv_txt = {"hot": "🔴 过热", "cold": "🟢 低估"}.get(lv, "🟡 中性")
+    m = info.get("metric") or ""
+    base = f"{lv_txt} · {m}" if "/" in m else f"{lv_txt} · {m} {info['pct']:.0f}%分位"
+    y = info.get("yield_pct")
+    if info.get("src") == "index" and y:
+        base += f" · 息{y:.1f}%"
+    return base
+
+def val_detail_text(info):
+    """v1.5：估值完整一行文本（详情页/tooltip 用）。无信息返回 ""。"""
+    if not info: return ""
+    if info.get("src") == "na":
+        return f"{info.get('metric','')}·无估值口径"
+    pct = info.get("pct")
+    if pct is None: return ""
+    lv_txt = {"hot": "过热", "cold": "低估"}.get(val_level(pct), "中性")
+    if info.get("src") == "nav":
+        return f"估值参考：近 1 年净值分位 {pct:.0f}%（{lv_txt}）·主动基金无 PE/PB 口径"
+    parts = []
+    if info.get("pe"): parts.append(f"PE {info['pe']:.2f}（{info.get('pe_pct',0):.1f}%分位）")
+    if info.get("pb"): parts.append(f"PB {info['pb']:.2f}（{info.get('pb_pct',0):.1f}%分位）")
+    if info.get("yield_pct"): parts.append(f"股息率 {info['yield_pct']:.2f}%")
+    return f"估值参考（{info.get('idx','跟踪指数')}，{lv_txt}）：" + "｜".join(parts)
+
+def sort_card_codes(codes, mode, val_map=None, chg_map=None, mv_map=None):
+    """v1.5：卡片排序。default/val_asc(低估优先)/val_desc/chg_desc/mv_desc；无数据排最后。"""
+    codes = list(codes)
+    vm = val_map or {}
+    if mode == "val_asc":
+        return sorted(codes, key=lambda c: (vm.get(c) is None, vm.get(c) if vm.get(c) is not None else 0))
+    if mode == "val_desc":
+        return sorted(codes, key=lambda c: (vm.get(c) is None, -(vm.get(c) or 0)))
+    if mode == "chg_desc":
+        return sorted(codes, key=lambda c: -(chg_map or {}).get(c, -999))
+    if mode == "mv_desc":
+        return sorted(codes, key=lambda c: -(mv_map or {}).get(c, -1))
+    return codes
 
 
 def fetch_one(code):
@@ -873,7 +918,11 @@ class ValWorker(QThread):
             if idx:
                 pct, metric = pick_index_pct(idx, val_map[idx])
                 if pct is not None:
-                    out[code] = {"pct": pct, "metric": metric, "src": "index"}
+                    v = val_map[idx]
+                    out[code] = {"pct": pct, "metric": metric, "src": "index", "idx": idx,
+                                 "pe": v.get("pe"), "pb": v.get("pb"),
+                                 "pe_pct": v.get("pe_pct"), "pb_pct": v.get("pb_pct"),
+                                 "yield_pct": v.get("yield_pct")}  # v1.5：带全量估值数据供卡片/详情页展示
                     continue
             nav_todo[code] = nav
         def one(code):
@@ -1009,25 +1058,21 @@ class FundCard(QFrame):
         self.lbl_val.setText("估值 ⏳"); self.lbl_val.setStyleSheet("color:#bbb;")
 
     def set_val(self, info):
-        """v1.3/v1.4：估值信号。info={"pct":百分位, "metric":PE/PB/净值/族名, "src":index/nav/na} 或 None。"""
+        """v1.3/v1.5：估值信号。info={pct, metric, src: index/nav/na, pe/pb/息…} 或 None。"""
         if getattr(self, "_cleared", False): return
-        if info and info.get("src") == "na":  # v1.4：债基/货币/商品无估值口径，如实标注不出信号
-            self.lbl_val.setText(f"{info.get('metric','')}·无估值口径"); self.lbl_val.setStyleSheet("color:#bbb;")
+        if info and info.get("src") == "na":  # 债基/货币/商品无估值口径，如实标注不出信号
+            self.lbl_val.setText(val_detail_text(info)); self.lbl_val.setStyleSheet("color:#bbb;")
+            self.lbl_val.setToolTip(val_detail_text(info) + "｜仅信息展示，不构成投资建议")
             return
-        if not info or info.get("pct") is None:
+        txt = val_signal_text(info)
+        if not txt:
             self.lbl_val.setText("估值 —"); self.lbl_val.setStyleSheet("color:#bbb;")
             return
-        pct = info["pct"]; m = info.get("metric") or ""
-        lv = val_level(pct)
-        if lv == "hot": lv_txt, col = "🔴 过热", "#e53935"
-        elif lv == "cold": lv_txt, col = "🟢 低估", "#16a34a"
-        else: lv_txt, col = "🟡 中性", "#b45309"
-        if "/" in m:  # PE+PB 结合指数：标签列双值，均值分位进 tooltip
-            self.lbl_val.setText(f"{lv_txt} · {m}")
-            self.lbl_val.setToolTip(f"PE+PB 结合估值（两项均值 {pct:.0f}% 分位）：指数跨科技与金融地产，单一指标会失真。仅信息展示，不构成投资建议。")
-        else:
-            self.lbl_val.setText(f"{lv_txt} · {m} {pct:.0f}%分位")
+        self.lbl_val.setText(txt)
+        col = {"hot": "#e53935", "cold": "#16a34a"}.get(val_level(info["pct"]), "#b45309")
         self.lbl_val.setStyleSheet(f"color:{col};")
+        tip = val_detail_text(info)  # v1.5：悬停看完整估值数据
+        if tip: self.lbl_val.setToolTip(tip + "｜仅信息展示，不构成投资建议")
 
     def update_data(self, d, resolved):
         if getattr(self, "_cleared", False): return          # 灰章状态: 行情不覆盖灰章
@@ -1093,6 +1138,9 @@ class DetailPage(QWidget):
         self.lbl_track = QLabel(""); self.lbl_track.setFont(QFont(FONT,8))
         self.lbl_track.setStyleSheet("QLabel{color:#6b7280;background:#f7f9fc;border:1px solid #eef0f3;border-radius:6px;padding:4px 8px;}")
         self.lbl_track.setWordWrap(True); self.lbl_track.hide(); lay.addWidget(self.lbl_track)
+        self.lbl_valinfo = QLabel(""); self.lbl_valinfo.setFont(QFont(FONT,8))  # v1.5：详情页完整估值面板
+        self.lbl_valinfo.setStyleSheet("QLabel{color:#6b7280;background:#f7f9fc;border:1px solid #eef0f3;border-radius:6px;padding:4px 8px;}")
+        self.lbl_valinfo.setWordWrap(True); self.lbl_valinfo.hide(); lay.addWidget(self.lbl_valinfo)
         vbar = QHBoxLayout()
         self._vbg = QButtonGroup(self); self._vbtns = {}
         for i,(k,ico) in enumerate([("nav","📈 净值走势"),("dd","📉 回撤修复"),("rank","🏅 同类排名")]):
@@ -1186,8 +1234,13 @@ class DetailPage(QWidget):
         self._hist_worker = None; self._idx_worker = None
         self._rank_by_ts = {}; self._rank_full = []
 
-    def load(self, code, rec2):
+    def load(self, code, rec2, val=None):
         self._code = code; self.lbl_title.setText(f"{NAME_MAP.get(code,'')}  详情")
+        vt = val_detail_text(val) if val else ""  # v1.5：完整估值面板
+        if vt:
+            self.lbl_valinfo.setText("🧭 " + vt + "｜仅信息展示，不构成投资建议"); self.lbl_valinfo.show()
+        else:
+            self.lbl_valinfo.hide()
         tk = TRACK.get(code)
         if tk:
             self.lbl_track.setText(f"📌 {tk[0]} ｜ {tk[1]}"); self.lbl_track.show()
@@ -3074,7 +3127,21 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setMinimumWidth(440)
         scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
         self.cards_wrap = QWidget(); self.cards_layout = QVBoxLayout(self.cards_wrap); self.cards_layout.setSpacing(8); self.cards_layout.addStretch()
-        scroll.setWidget(self.cards_wrap); split.addWidget(scroll)
+        scroll.setWidget(self.cards_wrap)
+        right_wrap = QWidget(); rw = QVBoxLayout(right_wrap); rw.setContentsMargins(0,0,0,0); rw.setSpacing(6)
+        sort_row = QHBoxLayout()  # v1.5：卡片排序
+        _sort_lbl = QLabel("卡片排序"); _sort_lbl.setFont(QFont(FONT,9)); _sort_lbl.setStyleSheet("color:#999;")
+        self._sort_combo = QComboBox(); self._sort_combo.setFont(QFont(FONT,9))
+        for _t, _v in (("默认顺序","default"),("估值·低估优先","val_asc"),("估值·过热优先","val_desc"),("今日涨幅优先","chg_desc"),("持有金额优先","mv_desc")):
+            self._sort_combo.addItem(_t, _v)
+        self._sort_combo.setStyleSheet("QComboBox{padding:3px 8px;border:1px solid #ddd;border-radius:6px;background:#fff;}")
+        _sm = (load_settings() or {}).get("sort_mode", "default")
+        _six = self._sort_combo.findData(_sm)
+        if _six >= 0: self._sort_combo.setCurrentIndex(_six)
+        self._sort_combo.currentIndexChanged.connect(self._on_sort_change)
+        sort_row.addWidget(_sort_lbl); sort_row.addWidget(self._sort_combo); sort_row.addStretch()
+        rw.addLayout(sort_row); rw.addWidget(scroll, 1)
+        split.addWidget(right_wrap)
         split.setChildrenCollapsible(False); split.setStretchFactor(0, 4); split.setStretchFactor(1, 6)
         split.setSizes([520, 760])
         outer.addWidget(split, 1)
@@ -3115,6 +3182,30 @@ class MainWindow(QMainWindow):
             eff = QGraphicsOpacityEffect(c); c.setGraphicsEffect(eff); eff.setOpacity(0.0)
             a = QPropertyAnimation(eff, b"opacity", c); a.setDuration(260); a.setStartValue(0.0); a.setEndValue(1.0)
             c._fade_anim = a; a.start(QAbstractAnimation.DeleteWhenStopped)
+
+    def _on_sort_change(self):
+        """v1.5：排序选择持久化到 settings.json（schema 只增不改）并重排。"""
+        if not hasattr(self, "_sort_combo"): return
+        s = load_settings() or {}; s["sort_mode"] = self._sort_combo.currentData(); save_settings(s)
+        self._apply_sort()
+
+    def _apply_sort(self):
+        """v1.5：按当前排序模式重排卡片（removeWidget 不删控件，仅重新插入）。"""
+        if not hasattr(self, "_sort_combo") or not self.cards: return
+        mode = self._sort_combo.currentData()
+        if mode == "default":
+            order = [c for c, _ in FUNDS if c in self.cards]
+        else:
+            val_map = {c: (info or {}).get("pct") for c, info in (self._val_cache.get("pct") or {}).items()}
+            chg_map = {d["code"]: d.get("chg",0) for d in self.last_results if d.get("status")=="ok"}
+            mv_map = {}
+            for d in self.last_results:
+                r2 = self.resolved.get(d["code"]); nav = d.get("nav",0)
+                if r2 and r2.get("shares") and nav: mv_map[d["code"]] = float(r2["shares"]) * nav
+            order = sort_card_codes(self.cards.keys(), mode, val_map, chg_map, mv_map)
+        for c in self.cards.values(): self.cards_layout.removeWidget(c)
+        for code in order:
+            if code in self.cards: self.cards_layout.insertWidget(self.cards_layout.count()-1, self.cards[code])
 
     def _sync_empty_banner(self):
         self.lbl_empty.setVisible(not FUNDS)
@@ -3165,6 +3256,7 @@ class MainWindow(QMainWindow):
         for c, info in info_map.items():
             card = self.cards.get(c)
             if card: card.set_val(info)
+        self._apply_sort()  # v1.5：估值到达后按分位排序才有数据
 
     def _apply_results(self):
         price_map = {d["code"]: d.get("nav",0) for d in self.last_results if d.get("status")=="ok"}
@@ -3197,6 +3289,7 @@ class MainWindow(QMainWindow):
             self.lbl_fix.show()
         else:
             self.lbl_fix.hide()
+        self._apply_sort()  # v1.5：新数据到达后维持排序
 
     def _update_board(self, results):
         clr = getattr(self, "_cleared_codes", set()) or set()
@@ -3390,7 +3483,7 @@ class MainWindow(QMainWindow):
         if self.last_results:
             self._apply_results()
 
-    def _open_detail(self, code): self.detail.load(code, self.resolved.get(code, {})); self.stack.setCurrentIndex(1)
+    def _open_detail(self, code): self.detail.load(code, self.resolved.get(code, {}), (self._val_cache.get("pct") or {}).get(code)); self.stack.setCurrentIndex(1)
     def _go_home(self): self.stack.setCurrentIndex(0)
 
     def _redraw_aggregates(self):
