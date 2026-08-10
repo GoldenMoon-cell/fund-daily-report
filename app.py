@@ -28,8 +28,9 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, QTimer, QPropertyAnimation, QAbstractAnimation, QDate,
+    QPointF, QRectF,
 )
-from PySide6.QtGui import QFont, QColor, QCursor
+from PySide6.QtGui import QFont, QColor, QCursor, QPainter, QPen, QPixmap, QPainterPath, QIcon
 import pyqtgraph as pg
 
 # 工作目录固定为程序所在目录，保证相对路径在源码/脚本/打包环境下行为一致
@@ -113,11 +114,228 @@ SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
 SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "1.5.0"
+APP_VERSION = "2.0.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
 HL = QColor("#fff7d6")
+
+# ---------- v1.7 主题地基：语义令牌字典（FD-HIG 落地基础，2.0.0 全面焕新的骨架） ----------
+# 令牌语义见《设计规范.md》；classic=1.x 原样（视觉零变化），其余三套为 FD-HIG 定案色板。
+THEMES = {
+    "classic": {"name": "经典", "dark": False, "win_bg": "",
+        "card_bg": "#ffffff", "card_border": "#eeeeee", "card_hover": "#bbccdd", "hover_bg": "#f3f4f6",
+        "cleared_bg": "#f6f6f6", "cleared_border": "#bbbbbb",
+        "panel_bg": "#f7f9fc", "panel_border": "#eef0f3",
+        "text": "#222222", "text_sub": "#666666", "muted": "#999999", "faint": "#bbbbbb",
+        "up": "#e53935", "down": "#16a34a", "flat": "#888888", "mid_val": "#b45309",
+        "accent": "#2563eb", "accent_hover": "#1d4ed8",
+        "accent_soft": "#eef3ff", "accent_soft_hover": "#dbe6ff", "btn_disabled_bg": "#eeeeee"},
+    "b_dark": {"name": "深空暗", "dark": True, "win_bg": "#10151c",
+        "card_bg": "#161d27", "card_border": "#313d4d", "card_hover": "#334052", "hover_bg": "#1b2430",
+        "cleared_bg": "#141a22", "cleared_border": "#3a4656",
+        "panel_bg": "#161d27", "panel_border": "#313d4d",
+        "text": "#e8edf3", "text_sub": "#c9d2dc", "muted": "#97a4b4", "faint": "#707e8e",
+        "up": "#ff5d5d", "down": "#34c77b", "flat": "#8b96a3", "mid_val": "#d97706",
+        "accent": "#3d7eff", "accent_hover": "#2f6ae0",
+        "accent_soft": "#1b2a4a", "accent_soft_hover": "#223559", "btn_disabled_bg": "#1a212b"},
+    "b_light": {"name": "晨雾浅色", "dark": False, "win_bg": "#f5f7fa",
+        "card_bg": "#ffffff", "card_border": "#e4e9f0", "card_hover": "#c9d4e4", "hover_bg": "#edf0f4",
+        "cleared_bg": "#f2f4f7", "cleared_border": "#d3dae3",
+        "panel_bg": "#ffffff", "panel_border": "#e4e9f0",
+        "text": "#1a2230", "text_sub": "#4a5568", "muted": "#6b7889", "faint": "#9aa5b3",
+        "up": "#e5484d", "down": "#18a058", "flat": "#888888", "mid_val": "#b45309",
+        "accent": "#2563eb", "accent_hover": "#1d4ed8",
+        "accent_soft": "#e8efff", "accent_soft_hover": "#d5e2ff", "btn_disabled_bg": "#eef0f3"},
+    "paper": {"name": "纸账本", "dark": False, "win_bg": "#f7f1e6",
+        "card_bg": "#fffbf2", "card_border": "#e2d5b8", "card_hover": "#cdbb92", "hover_bg": "#f1e8d6",
+        "cleared_bg": "#f3ecdd", "cleared_border": "#d8c9a8",
+        "panel_bg": "#fffbf2", "panel_border": "#e2d5b8",
+        "text": "#2b2620", "text_sub": "#5c5346", "muted": "#8a7f6d", "faint": "#b0a691",
+        "up": "#c23d2e", "down": "#2f7d5c", "flat": "#8a7f6d", "mid_val": "#b45309",
+        "accent": "#c23d2e", "accent_hover": "#a83325",
+        "accent_soft": "#f7e8dd", "accent_soft_hover": "#f0dbc9", "btn_disabled_bg": "#efe7d8"},
+}
+_THEME = "classic"
+def T():
+    """当前主题令牌表（v1.7）。"""
+    return THEMES.get(_THEME) or THEMES["classic"]
+def set_theme(name):
+    """v1.7：切换活动主题并同步全局信号色常量；应在构建 UI 前或 _restyle_all 前调用。"""
+    global _THEME, RED, GREEN, GRAY
+    if name in THEMES: _THEME = name
+    t = T(); RED, GREEN, GRAY = t["up"], t["down"], t["flat"]
+def card_qss_normal():
+    t = T(); return f"FundCard{{background:{t['card_bg']};border:1px solid {t['card_border']};border-radius:10px;}}FundCard:hover{{border:1px solid {t['card_hover']};}}"
+def card_qss_cleared():
+    t = T(); return f"FundCard{{background:{t['cleared_bg']};border:1px dashed {t['cleared_border']};border-radius:10px;}}"
+def panel_qss():
+    t = T(); return f"QFrame{{background:{t['panel_bg']};border-radius:10px;}}"
+def board_qss():
+    t = T(); return f"QFrame{{background:{t['card_bg']};border:1px solid {t['card_border']};border-radius:10px;}}"
+def ghost_btn_qss(t=None, pad="7px 12px"):
+    """v2.0.0：幽灵按钮（FD-HIG 按钮家族 Ghost：透明底+发丝边，导航/工具用）。"""
+    t = t or T()
+    return (f"QPushButton{{padding:{pad};border:1px solid {t['card_border']};border-radius:6px;"
+            f"background:transparent;color:{t['text_sub']};}}"
+            f"QPushButton:hover{{background:{t['hover_bg']};color:{t['text']};}}")
+def primary_btn_qss(t=None):
+    """v2.0.0：主操作按钮（FD-HIG Primary：每屏最多一个）。"""
+    t = t or T()
+    return (f"QPushButton{{padding:8px 14px;border-radius:6px;background:{t['accent']};color:#ffffff;border:none;}}"
+            f"QPushButton:hover{{background:{t['accent_hover']};}}"
+            f"QPushButton:disabled{{background:{t['btn_disabled_bg']};color:{t['flat']};}}")
+def soft_btn_qss(t=None):
+    """v2.0.0：软按钮（FD-HIG Soft：卡片内轻操作）。"""
+    t = t or T()
+    return (f"QPushButton{{padding:6px 12px;border-radius:6px;background:{t['accent_soft']};color:{t['accent']};border:none;}}"
+            f"QPushButton:hover{{background:{t['accent_soft_hover']};}}")
+def danger_btn_qss(t=None, pad="8px 14px"):
+    """v2.0.0：危险按钮（FD-HIG Danger：破坏性操作，红描边红字）。"""
+    t = t or T()
+    return (f"QPushButton{{padding:{pad};border-radius:6px;background:transparent;color:{t['up']};border:1px solid {t['card_border']};}}"
+            f"QPushButton:hover{{background:{t['hover_bg']};border-color:{t['up']};}}")
+def panel_label_qss(kind="tip"):
+    """v2.0.0：提示条标签（tip 中性 / warn 警示 / ok 成功），全主题适配。"""
+    t = T()
+    if kind == "warn":
+        return f"QLabel{{color:{t['mid_val']};background:{t['hover_bg']};border:1px solid {t['card_border']};border-radius:8px;padding:6px 10px;}}"
+    if kind == "ok":
+        return f"QLabel{{color:{t['down']};background:{t['hover_bg']};border:1px solid {t['card_border']};border-radius:8px;padding:6px 10px;}}"
+    return f"QLabel{{color:{t['text_sub']};background:{t['panel_bg']};border:1px solid {t['panel_border']};border-radius:8px;padding:8px;}}"
+def table_qss(extra=""):
+    """v2.0.0：表格主题样式（背景/斑马纹/表头/选中态）。"""
+    t = T()
+    return (f"QTableWidget{{background:{t['card_bg']};alternate-background-color:{t['panel_bg']};color:{t['text']};"
+            f"gridline-color:{t['card_border']};border:1px solid {t['card_border']};{extra}}}"
+            f"QTableWidget::item:selected{{background:{t['accent_soft']};color:{t['text']};}}"
+            f"QHeaderView::section{{background:{t['panel_bg']};color:{t['text_sub']};border:none;padding:5px;font-weight:bold;}}")
+_ARROW_FILES = {}
+def _arrow_png(kind, color):
+    """v2.0.0：下拉/日期控件箭头用 QPainter 直画存 PNG，QSS 按绝对路径引用。
+       （CSS 边框三角在 Qt 里实测渲染成横条，弃用。）"""
+    key = (kind, color)
+    path = _ARROW_FILES.get(key)
+    if path and os.path.exists(path):
+        return path
+    pm = QPixmap(20, 12); pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color)); pen.setWidthF(2.2); pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    if kind == "down":
+        p.drawPolyline([QPointF(3,3), QPointF(10,9.5), QPointF(17,3)])
+    else:
+        p.drawPolyline([QPointF(3,9.5), QPointF(10,3), QPointF(17,9.5)])
+    p.end()
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), f"fund_arrow_{kind}_{color[1:]}.png").replace("\\", "/")
+    pm.save(path, "PNG")
+    _ARROW_FILES[key] = path
+    return path
+
+def combo_qss(t=None):
+    """v2.0.0：下拉框 Win11 风格（圆角/扁平/手绘箭头，去原生斜边框）。"""
+    t = t or T()
+    arrow = _arrow_png("down", t["muted"])
+    return (f"QComboBox{{padding:6px 12px;border:1px solid {t['card_border']};border-radius:6px;"
+            f"background:{t['card_bg']};color:{t['text']};}}"
+            f"QComboBox:hover{{border-color:{t['muted']};}}"
+            f"QComboBox:focus{{border-color:{t['accent']};}}"
+            f"QComboBox::drop-down{{border:none;width:26px;}}"
+            f"QComboBox::down-arrow{{image:url({arrow});width:12px;height:8px;margin-right:8px;}}")
+def input_qss(t=None):
+    t = t or T()
+    return f"QLineEdit{{padding:6px 8px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}"
+def hl_bg():
+    """主题感知的“本金误填”行高亮色（暗色主题用暗琥珀，避免刺眼亮黄）。"""
+    return QColor("#3d3216") if T().get("dark") else QColor("#fff7d6")
+def imp_bg():
+    """主题感知的“导入/对账待核对”单元格高亮色。"""
+    return QColor("#4a3419") if T().get("dark") else QColor("#ffe0b2")
+def blend_color(bg_hex, fg_hex, alpha):
+    """v2.0.0：把 fg 按 alpha 混入 bg（收益日历格子配色用，全主题通用）。"""
+    b = QColor(bg_hex); f = QColor(fg_hex)
+    return QColor(int(b.red()*(1-alpha)+f.red()*alpha), int(b.green()*(1-alpha)+f.green()*alpha), int(b.blue()*(1-alpha)+f.blue()*alpha)).name()
+def global_qss(t):
+    """v2.0.0：弹窗/表格/输入类控件的全局主题样式（classic 不应用，保原生外观）。"""
+    win_bg = t["win_bg"] or "#ffffff"
+    return (f"QDialog,QMessageBox{{background:{t['card_bg']};}}"
+            f"QDialog QLabel,QMessageBox QLabel{{color:{t['text']};background:transparent;}}"
+            f"QDialog QPushButton,QMessageBox QPushButton{{padding:6px 14px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}"
+            f"QDialog QPushButton:hover,QMessageBox QPushButton:hover{{background:{t['hover_bg']};}}"
+            f"QDialog QComboBox,QMessageBox QComboBox{{padding:6px 12px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}"
+                        f"QDialog QComboBox::drop-down,QMessageBox QComboBox::drop-down{{border:none;width:26px;}}"
+                        f"QDialog QComboBox::down-arrow,QMessageBox QComboBox::down-arrow{{image:url({_arrow_png('down', t['muted'])});width:12px;height:8px;margin-right:8px;}}"
+            f"QDialog QDateEdit::up-button,QDialog QDateEdit::down-button{{border:none;width:16px;background:transparent;}}"
+            f"QDialog QDateEdit::up-arrow{{image:url({_arrow_png('up', t['muted'])});width:10px;height:7px;}}"
+            f"QDialog QDateEdit::down-arrow{{image:url({_arrow_png('down', t['muted'])});width:10px;height:7px;}}"
+            f"QComboBox QAbstractItemView{{background:{t['card_bg']};color:{t['text']};border:1px solid {t['card_border']};selection-background-color:{t['accent_soft']};selection-color:{t['accent']};}}"
+            f"QDialog QTextEdit,QDialog QLineEdit,QDialog QDateEdit{{background:{win_bg};color:{t['text']};border:1px solid {t['card_border']};border-radius:6px;padding:4px;}}"
+            f"QDialog QCheckBox,QDialog QRadioButton{{color:{t['text']};}}"
+            f"QDialog QTableWidget{{background:{t['card_bg']};alternate-background-color:{t['panel_bg']};color:{t['text']};gridline-color:{t['card_border']};border:1px solid {t['card_border']};}}"
+            f"QDialog QHeaderView::section{{background:{t['panel_bg']};color:{t['text_sub']};border:none;padding:4px;}}"
+            f"QCalendarWidget{{background:{t['card_bg']};color:{t['text']};}}"
+            f"QCalendarWidget QToolButton{{color:{t['text']};}}"
+            f"QScrollArea{{border:none;background:transparent;}}"
+            f"QToolTip{{background:{t['card_bg']};color:{t['text']};border:1px solid {t['card_border']};}}"
+            f"QScrollBar:vertical{{background:transparent;width:10px;}}"
+            f"QScrollBar::handle:vertical{{background:{t['card_border']};border-radius:5px;min-height:24px;}}")
+
+def icon_pixmap(kind, color, size=24, stroke=1.6):
+    """v2.0.0：原创手绘图标（QPainter 直画，无 emoji 无图标库）。
+       FD-HIG 图标规范：24 网格 / 1.5~1.6 线宽 / 圆帽圆角连接 / 单色。"""
+    pm = QPixmap(size, size); pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color)); pen.setWidthF(stroke); pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen); p.setBrush(Qt.NoBrush)
+    k = size / 24.0
+    def pt(x, y): return QPointF(x * k, y * k)
+    def pl(*pts):
+        pp = QPainterPath(pt(*pts[0]))
+        for q in pts[1:]: pp.lineTo(pt(*q))
+        return pp
+    if kind == "logo":  # 标识：圆角方框内上升折线+定位点
+        p.drawRoundedRect(QRectF(2.5*k, 2.5*k, 19*k, 19*k), 5*k, 5*k)
+        p.drawPath(pl((6.8,15.6),(10.2,11.5),(13.1,14.0),(17.0,8.8)))
+        p.setPen(Qt.NoPen); p.setBrush(QColor(color))
+        p.drawEllipse(pt(17.4, 8.2), 1.4*k, 1.4*k)
+    elif kind == "refresh":
+        pp = QPainterPath(); pp.arcTo(QRectF(4.5*k, 4.5*k, 15*k, 15*k), 65, 255)
+        p.drawPath(pp)
+        e = pp.currentPosition()
+        p.drawLine(e, QPointF(e.x() + 3.0*k, e.y() - 1.2*k))
+        p.drawLine(e, QPointF(e.x() + 0.8*k, e.y() - 3.2*k))
+    elif kind == "export":
+        p.drawLine(pt(12,4), pt(12,13))
+        p.drawPath(pl((8.6,9.8),(12,13.2),(15.4,9.8)))
+        p.drawPath(pl((5,16.5),(5,19),(19,19),(19,16.5)))
+    elif kind == "backup":
+        p.drawRoundedRect(QRectF(4*k, 4.5*k, 16*k, 4.5*k), 1.2*k, 1.2*k)
+        p.drawPath(pl((6,9),(6,17.8),(18,17.8),(18,9)))
+        p.drawLine(pt(10,12.9), pt(14,12.9))
+    elif kind == "about":
+        p.drawEllipse(pt(12,12), 8.5*k, 8.5*k)
+        p.drawLine(pt(12,11.2), pt(12,16.4))
+        p.drawLine(pt(12,7.7), pt(12,8.2))
+    elif kind == "hold":
+        p.drawRoundedRect(QRectF(3.5*k, 7.5*k, 17*k, 12*k), 2*k, 2*k)
+        p.drawPath(pl((9,7.5),(9,5.6),(15,5.6),(15,7.5)))
+        p.drawLine(pt(3.5,12.6), pt(20.5,12.6))
+    elif kind == "pnl":
+        p.drawLine(pt(4.5,19), pt(19.5,19))
+        p.drawLine(pt(8,19), pt(8,12.5)); p.drawLine(pt(12,19), pt(12,7.5)); p.drawLine(pt(16,19), pt(16,14.5))
+    elif kind == "trades":
+        p.drawRoundedRect(QRectF(5*k, 3.5*k, 14*k, 17*k), 2*k, 2*k)
+        p.drawLine(pt(8,8.2), pt(16,8.2)); p.drawLine(pt(8,12), pt(16,12)); p.drawLine(pt(8,15.8), pt(12.5,15.8))
+    elif kind == "diag":
+        p.drawPath(pl((3,12.5),(7,12.5),(9.4,7),(12.6,17),(15,12.5),(21,12.5)))
+    elif kind == "settings":
+        p.drawLine(pt(4,8), pt(20,8)); p.drawEllipse(pt(9.5,8), 2*k, 2*k)
+        p.drawLine(pt(4,16), pt(20,16)); p.drawEllipse(pt(14.5,16), 2*k, 2*k)
+    p.end()
+    return pm
 IMP = QColor("#ffe0b2")
 REPAIR_THRESHOLD = 0.5
 CMP_INDEX = [("1.000300", "沪深300"), ("1.000905", "中证500"), ("1.000016", "上证50"), ("0.399006", "创业板指")]
@@ -345,12 +563,6 @@ def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
 def _http(url):
     req = urllib.request.Request(url, headers=_HEADERS)
     with urllib.request.urlopen(req, timeout=12, context=_SSL) as r:
-        return r.read().decode("utf-8", errors="ignore")
-
-
-def _http_idx(url):
-    req = urllib.request.Request(url, headers=_HEADERS_IDX)
-    with urllib.request.urlopen(req, timeout=6, context=_SSL) as r:
         return r.read().decode("utf-8", errors="ignore")
 
 
@@ -674,15 +886,6 @@ def fetch_index_kline(secid):
 
 
 # ---------- 粘贴文本解析 ----------
-def _norm(s):
-    return re.sub(r"\s+", "", s or "")
-
-def _norm_name(s):
-    s = s or ""
-    s = re.sub(r"[（(][^）)]*[）)]", "", s)
-    s = re.sub(r"\s+", "", s)
-    return s.lower()
-
 def _coerce_item(it):
     """单只基金dict: 各种字段名/别名 → 标准键。给啥认啥, 认不到返回None。"""
     if not isinstance(it, dict):
@@ -959,6 +1162,13 @@ class BarChart(pg.PlotWidget):
         self._bar_item = None; self._anim_timer = None
         self._bars_x = []; self._bars_vals = []; self._bars_colors = []; self._bars_names = []
 
+    def apply_theme(self):
+        """v2.0.0：柱状图按主题令牌着色（背景/轴线/刻度文字）。"""
+        t = T()
+        self.setBackground(QColor(t["card_bg"]))
+        ax = self.getAxis("left")
+        ax.setTextPen(QColor(t["muted"])); ax.setPen(QColor(t["card_border"]))
+
     def draw(self, items, animate=True):
         self.clear(); self._bar_item = None
         if self._anim_timer:
@@ -1009,20 +1219,20 @@ class ElideLabel(QLabel):
 class FundCard(QFrame):
     def __init__(self, code):
         super().__init__(); self.code = code; self.setFrameShape(QFrame.StyledPanel)
-        self.setStyleSheet("FundCard{background:#fff;border:1px solid #eee;border-radius:10px;}FundCard:hover{border:1px solid #bcd;}")
+        self.setStyleSheet(card_qss_normal())  # v1.7 令牌化
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         lay = QHBoxLayout(self); lay.setContentsMargins(14,12,14,12)
         left = QVBoxLayout(); left.setSpacing(2)
         self.lbl_name = ElideLabel("—"); self.lbl_name.setFont(QFont(FONT,11,QFont.Bold))
         self.lbl_name.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); self.lbl_name.setMinimumWidth(0)
-        self.lbl_code = QLabel(code); self.lbl_code.setFont(QFont(FONT,8)); self.lbl_code.setStyleSheet("color:#999;")
+        self.lbl_code = QLabel(code); self.lbl_code.setFont(QFont(FONT,8)); self.lbl_code.setStyleSheet(f"color:{T()['muted']};")
         self.lbl_val = QLabel(""); self.lbl_val.setFont(QFont(FONT,8))  # v1.3 估值红绿灯
         self.lbl_val.setToolTip("估值参考（v1.4）：指数基金看跟踪指数 PE/PB 百分位（红利/金融族看 PB）；主动基金显示近 1 年净值分位；债基/货币/商品无估值口径不显示信号。≥80% 过热，≤20% 低估。仅信息展示，不构成投资建议。")
         left.addWidget(self.lbl_name); left.addWidget(self.lbl_code); left.addWidget(self.lbl_val); lay.addLayout(left,3)
         mid = QVBoxLayout(); mid.setSpacing(2)
-        self.lbl_nav = QLabel("净值 —"); self.lbl_nav.setFont(QFont(FONT,9)); self.lbl_nav.setStyleSheet("color:#666;")
+        self.lbl_nav = QLabel("净值 —"); self.lbl_nav.setFont(QFont(FONT,9)); self.lbl_nav.setStyleSheet(f"color:{T()['text_sub']};")
         self.lbl_nav.setMinimumWidth(0)
-        self.lbl_mv = QLabel(""); self.lbl_mv.setFont(QFont(FONT,9,QFont.Bold)); self.lbl_mv.setStyleSheet("color:#222;"); self.lbl_mv.setMinimumWidth(0)
+        self.lbl_mv = QLabel(""); self.lbl_mv.setFont(QFont(FONT,9,QFont.Bold)); self.lbl_mv.setStyleSheet(f"color:{T()['text']};"); self.lbl_mv.setMinimumWidth(0)
         self.lbl_today = QLabel("今日 —"); self.lbl_today.setFont(QFont(FONT,9,QFont.Bold)); self.lbl_today.setMinimumWidth(0)
         self.lbl_pnl = QLabel("累计 —"); self.lbl_pnl.setFont(QFont(FONT,8)); self.lbl_pnl.setMinimumWidth(0)
         mid.addWidget(self.lbl_nav); mid.addWidget(self.lbl_mv); mid.addWidget(self.lbl_today); mid.addWidget(self.lbl_pnl); lay.addLayout(mid,2)
@@ -1030,11 +1240,17 @@ class FundCard(QFrame):
         right = QVBoxLayout(); right.setSpacing(6)
         self.btn_clear = QPushButton("标记清仓"); self.btn_clear.setFont(QFont(FONT,8))
         self.btn_clear.setCheckable(True)
-        self.btn_clear.setStyleSheet("QPushButton{padding:4px 8px;border-radius:6px;background:#f5f5f5;color:#888;border:1px solid #ddd;}QPushButton:hover{background:#eee;}QPushButton:checked{background:#e8e8e8;color:#555;border:1px dashed #999;}")
         right.addWidget(self.btn_clear)
         self.btn_detail = QPushButton("详情 →"); self.btn_detail.setFont(QFont(FONT,9))
-        self.btn_detail.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef3ff;color:#2563eb;border:none;}QPushButton:hover{background:#dbe6ff;}")
+        self._theme_btns()
         right.addWidget(self.btn_detail,1); lay.addLayout(right,1)
+
+    def _theme_btns(self):
+        """v2.0.0：卡片按钮按当前主题重刷（构建与主题切换共用）。"""
+        t = T()
+        self.btn_clear.setStyleSheet(f"QPushButton{{padding:4px 8px;border-radius:6px;background:{t['hover_bg']};color:{t['muted']};border:1px solid {t['card_border']};}}QPushButton:hover{{background:{t['card_hover']};}}QPushButton:checked{{background:{t['cleared_bg']};color:{t['text_sub']};border:1px dashed {t['cleared_border']};}}")
+        if not getattr(self, "_cleared", False):
+            self.btn_detail.setStyleSheet(f"QPushButton{{padding:8px 12px;border-radius:8px;background:{t['accent_soft']};color:{t['accent']};border:none;}}QPushButton:hover{{background:{t['accent_soft_hover']};}}")
 
     def set_cleared(self, on):
         self._cleared = bool(on)
@@ -1042,34 +1258,34 @@ class FundCard(QFrame):
         self.btn_clear.setText("🚫 已清仓" if self._cleared else "标记清仓")
         self.btn_clear.setToolTip("已清仓: 不参与柱状图/红黑榜/总持仓统计, 卡片仅观察。点『恢复持有』还原。" if self._cleared else "卖出后盖灰章: 该只不再计入总账与榜单, 卡片置灰仅观察; 持仓记录不受影响, 可随时恢复。")
         if self._cleared:
-            self.setStyleSheet("FundCard{background:#f6f6f6;border:1px dashed #bbb;border-radius:10px;}")
-            self.lbl_chg.setText("已清仓"); self.lbl_chg.setStyleSheet("color:#999;font-size:12px;")
+            self.setStyleSheet(card_qss_cleared())
+            self.lbl_chg.setText("已清仓"); self.lbl_chg.setStyleSheet(f"color:{T()['muted']};font-size:12px;")
             self.lbl_val.setText("")  # v1.3：灰章不显示估值信号
-            self.lbl_mv.setText("仅观察·不计入总账"); self.lbl_mv.setStyleSheet("color:#aaa;")
-            self.lbl_today.setText("—"); self.lbl_today.setStyleSheet("color:#bbb;")
-            self.lbl_pnl.setText("持仓记录保留"); self.lbl_pnl.setStyleSheet("color:#bbb;")
-            self.btn_detail.setEnabled(False); self.btn_detail.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eee;color:#aaa;border:none;}")
+            self.lbl_mv.setText("仅观察·不计入总账"); self.lbl_mv.setStyleSheet(f"color:{T()['faint']};")
+            self.lbl_today.setText("—"); self.lbl_today.setStyleSheet(f"color:{T()['faint']};")
+            self.lbl_pnl.setText("持仓记录保留"); self.lbl_pnl.setStyleSheet(f"color:{T()['faint']};")
+            self.btn_detail.setEnabled(False); self.btn_detail.setStyleSheet(f"QPushButton{{padding:8px 12px;border-radius:8px;background:{T()['btn_disabled_bg']};color:{T()['faint']};border:none;}}")
         else:
-            self.setStyleSheet("FundCard{background:#fff;border:1px solid #eee;border-radius:10px;}FundCard:hover{border:1px solid #bcd;}")
-            self.btn_detail.setEnabled(True); self.btn_detail.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef3ff;color:#2563eb;border:none;}QPushButton:hover{background:#dbe6ff;}")
+            self.setStyleSheet(card_qss_normal())
+            self.btn_detail.setEnabled(True); self.btn_detail.setStyleSheet(f"QPushButton{{padding:8px 12px;border-radius:8px;background:{T()['accent_soft']};color:{T()['accent']};border:none;}}QPushButton:hover{{background:{T()['accent_soft_hover']};}}")
 
     def set_val_loading(self):
         if getattr(self, "_cleared", False): return
-        self.lbl_val.setText("估值 ⏳"); self.lbl_val.setStyleSheet("color:#bbb;")
+        self.lbl_val.setText("估值 ⏳"); self.lbl_val.setStyleSheet(f"color:{T()['faint']};")
 
     def set_val(self, info):
         """v1.3/v1.5：估值信号。info={pct, metric, src: index/nav/na, pe/pb/息…} 或 None。"""
         if getattr(self, "_cleared", False): return
         if info and info.get("src") == "na":  # 债基/货币/商品无估值口径，如实标注不出信号
-            self.lbl_val.setText(val_detail_text(info)); self.lbl_val.setStyleSheet("color:#bbb;")
+            self.lbl_val.setText(val_detail_text(info)); self.lbl_val.setStyleSheet(f"color:{T()['faint']};")
             self.lbl_val.setToolTip(val_detail_text(info) + "｜仅信息展示，不构成投资建议")
             return
         txt = val_signal_text(info)
         if not txt:
-            self.lbl_val.setText("估值 —"); self.lbl_val.setStyleSheet("color:#bbb;")
+            self.lbl_val.setText("估值 —"); self.lbl_val.setStyleSheet(f"color:{T()['faint']};")
             return
         self.lbl_val.setText(txt)
-        col = {"hot": "#e53935", "cold": "#16a34a"}.get(val_level(info["pct"]), "#b45309")
+        col = {"hot": T()["up"], "cold": T()["down"]}.get(val_level(info["pct"]), T()["mid_val"])
         self.lbl_val.setStyleSheet(f"color:{col};")
         tip = val_detail_text(info)  # v1.5：悬停看完整估值数据
         if tip: self.lbl_val.setToolTip(tip + "｜仅信息展示，不构成投资建议")
@@ -1080,10 +1296,10 @@ class FundCard(QFrame):
         if d.get("status") != "ok":
             self.lbl_nav.setText("净值 抓取失败"); self.lbl_nav.setStyleSheet("color:#e53935;")
             self.lbl_chg.setText("—"); self.lbl_chg.setStyleSheet(f"color:{GRAY};")
-            self.lbl_mv.setText(""); self.lbl_mv.setStyleSheet("color:#222;")
-            self.lbl_today.setText("今日 —"); self.lbl_today.setStyleSheet("color:#bbb;")
+            self.lbl_mv.setText(""); self.lbl_mv.setStyleSheet(f"color:{T()['text']};")
+            self.lbl_today.setText("今日 —"); self.lbl_today.setStyleSheet(f"color:{T()['faint']};")
             self.lbl_pnl.setText(f"⚠ {d.get('err','')[:18]}"); self.lbl_pnl.setStyleSheet("color:#e53935;font-size:8px;"); return
-        self.lbl_nav.setText(f"净值 {nav:.4f}"); self.lbl_nav.setStyleSheet("color:#666;")
+        self.lbl_nav.setText(f"净值 {nav:.4f}"); self.lbl_nav.setStyleSheet(f"color:{T()['text_sub']};")
         chg = d.get("chg",0); color = RED if chg>0 else (GREEN if chg<0 else GRAY)
         self.lbl_chg.setText(f"{chg:+.2f}%"); self.lbl_chg.setStyleSheet(f"color:{color};")
         nd = (d.get("nav_date") or "").strip()
@@ -1098,7 +1314,7 @@ class FundCard(QFrame):
         if r2 and r2.get("shares") and nav:
             sh = float(r2["shares"]); cost = float(r2.get("cost") or 0)
             mv = sh * nav
-            self.lbl_mv.setText(f"持有 ¥{mv:,.2f}"); self.lbl_mv.setStyleSheet("color:#222;")
+            self.lbl_mv.setText(f"持有 ¥{mv:,.2f}"); self.lbl_mv.setStyleSheet(f"color:{T()['text']};")
             if (100 + chg) != 0:
                 today_pnl = sh * nav * chg / (100 + chg)
                 tc = RED if today_pnl >= 0 else GREEN
@@ -1113,15 +1329,15 @@ class FundCard(QFrame):
                 self.lbl_pnl.setText("累计 未填成本"); self.lbl_pnl.setStyleSheet("color:#bbb;")
         else:
             # 无手填份额 → 提示去管理持仓填写（OCR 快照回退已移除）
-            self.lbl_mv.setText(""); self.lbl_mv.setStyleSheet("color:#222;")
-            self.lbl_today.setText(f"{day_tag} —"); self.lbl_today.setStyleSheet("color:#bbb;")
-            self.lbl_pnl.setText("盈亏 未填持仓"); self.lbl_pnl.setStyleSheet("color:#bbb;")
+            self.lbl_mv.setText(""); self.lbl_mv.setStyleSheet(f"color:{T()['text']};")
+            self.lbl_today.setText(f"{day_tag} —"); self.lbl_today.setStyleSheet(f"color:{T()['faint']};")
+            self.lbl_pnl.setText("盈亏 未填持仓"); self.lbl_pnl.setStyleSheet(f"color:{T()['faint']};")
 
 RANGE_DAYS = {"近1月": 30, "近3月": 90, "近6月": 180, "近1年": 365, "全部": None}
 
 class DetailPage(QWidget):
     def __init__(self, on_back):
-        super().__init__(); self._hist=[]; self._full=[]; self._code=None; self._my_rec2={}
+        super().__init__(); self.setObjectName("detailRoot"); self._hist=[]; self._full=[]; self._code=None; self._my_rec2={}
         self._dd=[]; self._dd_max=0.0; self._dd_max_idx=0
         self._dd_state="none"; self._dd_days=0; self._dd_progress=0.0; self._repair_idx=None; self._view="nav"
         self._buy_date=""
@@ -1143,7 +1359,7 @@ class DetailPage(QWidget):
         self.lbl_valinfo.setWordWrap(True); self.lbl_valinfo.hide(); lay.addWidget(self.lbl_valinfo)
         vbar = QHBoxLayout()
         self._vbg = QButtonGroup(self); self._vbtns = {}
-        for i,(k,ico) in enumerate([("nav","📈 净值走势"),("dd","📉 回撤修复"),("rank","🏅 同类排名")]):
+        for i,(k,ico) in enumerate([("nav","净值走势"),("dd","回撤修复"),("rank","同类排名")]):
             b = QPushButton(ico); b.setCheckable(True); b.setFont(QFont(FONT,9))
             b.setStyleSheet("QPushButton{padding:6px 14px;border:1px solid #ddd;border-radius:7px;background:#fff;}"
                             "QPushButton:checked{background:#374151;color:#fff;border-color:#374151;}")
@@ -1171,7 +1387,7 @@ class DetailPage(QWidget):
         self.lbl_dd_rep = QLabel("修复  —"); self.lbl_dd_rep.setFont(QFont(FONT,11,QFont.Bold)); self.lbl_dd_rep.setStyleSheet("color:#888;")
         dl.addWidget(self.lbl_dd_max); dl.addSpacing(28); dl.addWidget(self.lbl_dd_rep); dl.addStretch()
         self.dd_box.hide(); lay.addWidget(self.dd_box)
-        chart_box = QFrame(); chart_box.setStyleSheet("QFrame{background:#fff;border:1px solid #eee;border-radius:10px;}")
+        chart_box = QFrame(); chart_box.setStyleSheet(board_qss())  # v1.7 令牌化
         cl = QVBoxLayout(chart_box); cl.setContentsMargins(8,8,8,8)
         self._date_axis = DateAxis(orientation='bottom')
         self.plot = pg.PlotWidget(axisItems={'bottom': self._date_axis})
@@ -1233,6 +1449,30 @@ class DetailPage(QWidget):
         self.table.setStyleSheet("QTableWidget{font-size:12px;}"); lay.addWidget(self.table,2)
         self._hist_worker = None; self._idx_worker = None
         self._rank_by_ts = {}; self._rank_full = []
+        self._apply_theme()  # v2.0.0：按当前主题初始化详情页配色
+
+    def _apply_theme(self):
+        """v2.0.0：详情页主题适配（背景/面板/按钮组/图表）。"""
+        t = T()
+        self.setAutoFillBackground(True)
+        self.setStyleSheet(f"QWidget#detailRoot{{background:{t['win_bg']};}}" if t["win_bg"] else "")
+        self.lbl_title.setStyleSheet(f"color:{t['text']};")
+        self.lbl_my.setStyleSheet(f"color:{t['text_sub']};")
+        _tip = f"QLabel{{color:{t['text_sub']};background:{t['panel_bg']};border:1px solid {t['panel_border']};border-radius:6px;padding:4px 8px;}}"
+        self.lbl_track.setStyleSheet(_tip); self.lbl_valinfo.setStyleSheet(_tip)
+        self.btn_back.setStyleSheet(ghost_btn_qss(t, pad="8px 14px"))
+        _vb = (f"QPushButton{{padding:6px 14px;border:1px solid {t['card_border']};border-radius:7px;background:{t['card_bg']};color:{t['text_sub']};}}"
+               f"QPushButton:checked{{background:{t['accent']};color:#ffffff;border-color:{t['accent']};}}")
+        for b in self._vbtns.values(): b.setStyleSheet(_vb)
+        for b in self._rbtns.values(): b.setStyleSheet(_vb)
+        self._cmp_combo.setStyleSheet(f"QComboBox{{padding:4px 8px;border:1px solid {t['card_border']};border-radius:7px;background:{t['card_bg']};color:{t['text']};}}")
+        self._cmp_lbl.setStyleSheet(f"color:{t['muted']};font-size:9px;")
+        self._cmp_hint.setStyleSheet(f"color:{t['mid_val']};font-size:8px;")
+        self.dd_box.setStyleSheet(f"QFrame{{background:{t['hover_bg']};border:1px solid {t['card_border']};border-radius:10px;}}")
+        self.lbl_dd_max.setStyleSheet(f"color:{t['up']};"); self.lbl_dd_rep.setStyleSheet(f"color:{t['muted']};")
+        self.plot.setBackground(QColor(t["card_bg"]))
+        for _axn in ("left", "bottom"):
+            _a = self.plot.getAxis(_axn); _a.setTextPen(QColor(t["muted"])); _a.setPen(QColor(t["card_border"]))
 
     def load(self, code, rec2, val=None):
         self._code = code; self.lbl_title.setText(f"{NAME_MAP.get(code,'')}  详情")
@@ -1641,15 +1881,16 @@ def _ro(text):
 
 class PasteDialog(QDialog):
     def __init__(self, parent=None):
-        super().__init__(parent); self.setWindowTitle("📋 粘贴持仓文字"); self.resize(560,460)
+        super().__init__(parent); self.setWindowTitle("粘贴持仓文字"); self.resize(560,460)
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("把蚂蚁/天天基金里『持有份额、持仓成本价』那段【纯文本】整段复制粘贴到下面，点解析（不是csv/表格）：\n（注：『持有金额/市值』不会被导入——本金列需另行填写或留空。）\n⚠ 只认下面表里已有的基金（即首页看板上的基金）。列表外的新基金粘了会被悄悄跳过——要加新基金，请先回首页用『➕快速添加』，加完再来粘。"))
+        _p_lbl = QLabel("把蚂蚁/天天基金里『持有份额、持仓成本价』那段【纯文本】整段复制粘贴到下面，点解析（不是csv/表格）：\n（注：『持有金额/市值』不会被导入——本金列需另行填写或留空。）\n⚠ 只认下面表里已有的基金（即首页看板上的基金）。列表外的新基金粘了会被悄悄跳过——要加新基金，请先回首页用『快速添加』，加完再来粘。")
+        _p_lbl.setStyleSheet(f"color:{T()['text_sub']};"); lay.addWidget(_p_lbl)
         self.te = QTextEdit(); self.te.setPlaceholderText("例如：\n某某指数基金C\n持有份额 1234.56\n持仓成本价 1.0000\n……（多只一起粘也行；只认份额+成本价）")
         self.te.setFont(QFont(FONT,9)); lay.addWidget(self.te,3)
-        self.lbl = QLabel(""); self.lbl.setStyleSheet("color:#555;"); self.lbl.setWordWrap(True); lay.addWidget(self.lbl)
+        self.lbl = QLabel(""); self.lbl.setStyleSheet(f"color:{T()['text_sub']};"); self.lbl.setWordWrap(True); lay.addWidget(self.lbl)
         bar = QHBoxLayout(); bar.addStretch()
-        b = QPushButton("🔍 解析"); b.clicked.connect(self._parse)
-        b.setStyleSheet("QPushButton{padding:8px 16px;border-radius:8px;background:#2563eb;color:#fff;border:none;}")
+        b = QPushButton("解析"); b.clicked.connect(self._parse)
+        b.setStyleSheet(primary_btn_qss())
         bar.addWidget(b); lay.addLayout(bar)
         self.parsed = {}
     def _parse(self):
@@ -1668,23 +1909,24 @@ class PasteDialog(QDialog):
 
 class HoldDialog(QDialog):
     def __init__(self, resolved, corrected_codes, price_map, parent=None, account=None):
-        super().__init__(parent); self.setWindowTitle("💼 管理我的持仓"); self.resize(760,560)
+        super().__init__(parent); self.setWindowTitle("管理我的持仓"); self.resize(760,560)
         self._price = price_map; self._busy = True
         self._accounts = load_accounts()
         self._current_account = account or (self._accounts[0] if self._accounts else DEFAULT_ACCOUNT)
+        t = T()
         lay = QVBoxLayout(self)
         # —— 账户选择器 ——
         acc_bar = QHBoxLayout()
-        acc_bar.addWidget(QLabel("账户："))
+        _acc_lbl = QLabel("账户："); _acc_lbl.setStyleSheet(f"color:{t['muted']};"); acc_bar.addWidget(_acc_lbl)
         self._acc_combo = QComboBox()
         for a in self._accounts:
             self._acc_combo.addItem(a)
         idx = self._acc_combo.findText(self._current_account)
         if idx >= 0: self._acc_combo.setCurrentIndex(idx)
         self._acc_combo.currentTextChanged.connect(self._switch_account)
-        acc_bar.addWidget(self._acc_combo)
-        self._btn_manage_acc = QPushButton("⚙ 管理账户")
-        self._btn_manage_acc.setStyleSheet("QPushButton{padding:4px 10px;border-radius:6px;background:#f0f0f0;border:none;}QPushButton:hover{background:#e3e3e3;}")
+        self._acc_combo.setStyleSheet(combo_qss(t)); acc_bar.addWidget(self._acc_combo)
+        self._btn_manage_acc = QPushButton("管理账户")
+        self._btn_manage_acc.setStyleSheet(ghost_btn_qss(t, pad="4px 10px"))
         self._btn_manage_acc.clicked.connect(self._manage_accounts)
         acc_bar.addWidget(self._btn_manage_acc)
         acc_bar.addStretch()
@@ -1695,10 +1937,10 @@ class HoldDialog(QDialog):
                      "  • 「买入日期」选填，格式 2026-07-15；填写后详情页画📍首笔买入竖线+🟣成本横线，记不清可留空。\n"
                      "  • 快捷方式：「📋 粘贴导入」只自动填份额+成本价，本金/日期不改动。\n"
                      "  黄底行 = 程序判定填写的是本金，已自动 ÷份额 换算为每份成本。")
-        tip.setStyleSheet("color:#555;background:#f7f9fc;border-radius:8px;padding:8px;"); lay.addWidget(tip)
-        self.lbl_fix = QLabel(""); self.lbl_fix.setStyleSheet("color:#9a6b00;background:#fff7d6;border:1px solid #f0d97a;border-radius:8px;padding:6px 10px;")
+        tip.setStyleSheet(panel_label_qss("tip")); lay.addWidget(tip)
+        self.lbl_fix = QLabel(""); self.lbl_fix.setStyleSheet(panel_label_qss("warn"))
         self.lbl_fix.setWordWrap(True); self.lbl_fix.hide(); lay.addWidget(self.lbl_fix)
-        self.lbl_x = QLabel(""); self.lbl_x.setStyleSheet("color:#1b5e20;background:#e8f5e9;border:1px solid #a5d6a7;border-radius:8px;padding:6px 10px;")
+        self.lbl_x = QLabel(""); self.lbl_x.setStyleSheet(panel_label_qss("ok"))
         self.lbl_x.setWordWrap(True); self.lbl_x.hide(); lay.addWidget(self.lbl_x)
         raw_hold = load_holdings_for_account(self._current_account)
         self.table = QTableWidget(len(FUNDS),6)
@@ -1717,34 +1959,33 @@ class HoldDialog(QDialog):
             if code in corrected_codes:
                 for cc in range(6):
                     it = self.table.item(r,cc)
-                    if it: it.setBackground(HL)
+                    if it: it.setBackground(hl_bg())
+        self.table.setStyleSheet(table_qss())
         lay.addWidget(self.table)
         if corrected_codes:
             self.lbl_fix.setText(f"⚠ 已自动换算 {len(corrected_codes)} 只：『成本价』列中填写的实为『本金』，已 ÷份额 换算为『每份成本』(黄底行)。核对无误后点保存即永久修正。")
             self.lbl_fix.show()
         self.table.itemChanged.connect(self._on_cell); self._busy = False
         bar = QHBoxLayout()
-        b_paste = QPushButton("📋 粘贴填份额·成本"); b_paste.setToolTip("把支付宝/天天里『持有份额·持仓成本价』那段纯文本粘进来，一次灌进表。\n只填数字、不加新基金；新基金请先回首页『➕快速添加』。")
+        b_paste = QPushButton("粘贴填份额·成本"); b_paste.setToolTip("把支付宝/天天里『持有份额·持仓成本价』那段纯文本粘进来，一次灌进表。\n只填数字、不加新基金；新基金请先回首页『快速添加』。")
         b_paste.clicked.connect(self._paste_import)
-        b_paste.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#fff3e0;color:#e65100;border:1px solid #ffcc80;}QPushButton:hover{background:#ffe0b2;}")
-        bar.addWidget(b_paste)
-        b_x = QPushButton("🔍 对账"); b_x.setToolTip("用交易流水逐笔回放，算出每只基金『应有』份额/本金，与手填值比对。\n差异行用橙底填入流水算出的值（待你核对），点保存才落盘；\n手填比流水多的基金会提示去补录流水。")
+        b_paste.setStyleSheet(soft_btn_qss(t)); bar.addWidget(b_paste)
+        b_x = QPushButton("对账"); b_x.setToolTip("用交易流水逐笔回放，算出每只基金『应有』份额/本金，与手填值比对。\n差异行用橙底填入流水算出的值（待你核对），点保存才落盘；\n手填比流水多的基金会提示去补录流水。")
         b_x.clicked.connect(self._cross_check)
-        b_x.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#e3f2fd;color:#1565c0;border:1px solid #90caf9;}QPushButton:hover{background:#bbdefb;}")
-        bar.addWidget(b_x)
-        b_move = QPushButton("➡ 转移到其他账户"); b_move.setToolTip("把选中的基金持仓从当前账户转移到另一个账户。\n份额/成本/本金原样搬过去，不产生交易流水。")
+        b_x.setStyleSheet(soft_btn_qss(t)); bar.addWidget(b_x)
+        b_move = QPushButton("转移到其他账户"); b_move.setToolTip("把选中的基金持仓从当前账户转移到另一个账户。\n份额/成本/本金原样搬过去，不产生交易流水。")
         b_move.clicked.connect(self._move_to_account)
-        b_move.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#fce4ec;color:#880e4f;border:1px solid #f8bbd0;}QPushButton:hover{background:#f8bbd0;}")
+        b_move.setStyleSheet(soft_btn_qss(t))
         bar.addWidget(b_move); bar.addStretch()
-        b_trade = QPushButton("📝 记一笔交易"); b_trade.clicked.connect(self._record_trade)
-        b_trade.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#e8f5e9;color:#2e7d32;border:1px solid #a5d6a7;}QPushButton:hover{background:#c8e6c9;}")
+        b_trade = QPushButton("记一笔交易"); b_trade.clicked.connect(self._record_trade)
+        b_trade.setStyleSheet(soft_btn_qss(t))
         bar.addWidget(b_trade)
         b_clear = QPushButton("清空全部"); b_clear.clicked.connect(self._clear)
-        b_clear.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#f0f0f0;border:none;}")
+        b_clear.setStyleSheet(danger_btn_qss(t))
         b_cancel = QPushButton("取消"); b_cancel.clicked.connect(self.reject)
-        b_cancel.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#f0f0f0;border:none;}")
-        b_save = QPushButton("💾 保存"); b_save.clicked.connect(self._save)
-        b_save.setStyleSheet("QPushButton{padding:8px 16px;border-radius:8px;background:#2563eb;color:#fff;border:none;}QPushButton:hover{background:#1d4ed8;}")
+        b_cancel.setStyleSheet(ghost_btn_qss(t))
+        b_save = QPushButton("保存"); b_save.clicked.connect(self._save)
+        b_save.setStyleSheet(primary_btn_qss(t))
         bar.addWidget(b_clear); bar.addWidget(b_cancel); bar.addWidget(b_save); lay.addLayout(bar)
         self.saved = False
 
@@ -1765,7 +2006,7 @@ class HoldDialog(QDialog):
                     self.table.setItem(r,3,QTableWidgetItem(self._fmt(rec["cost"],4)))
                 for cc in (0,1,2,3):
                     it = self.table.item(r,cc)
-                    if it: it.setBackground(IMP)
+                    if it: it.setBackground(imp_bg())
         finally:
             self._busy = False
 
@@ -1798,7 +2039,7 @@ class HoldDialog(QDialog):
                     if d["principal"] > 0: self.table.setItem(r, 4, QTableWidgetItem(self._fmt(d["principal"], 2)))
                     for cc in (2, 3, 4):
                         it = self.table.item(r, cc)
-                        if it: it.setBackground(IMP)
+                        if it: it.setBackground(imp_bg())
                     filled += 1
                 else:
                     more_manual.append(name)
@@ -2039,14 +2280,15 @@ class HoldDialog(QDialog):
                 for cc in range(6):
                     it = self.table.item(r,cc)
                     if it:
-                        it.setBackground(HL if code in corrected else QColor(255,255,255,0))
+                        it.setBackground(hl_bg() if code in corrected else QColor(255,255,255,0))
         finally:
             self._busy = False
 
     def _manage_accounts(self):
         dlg = QDialog(self); dlg.setWindowTitle("管理账户"); dlg.resize(400, 300)
         lay = QVBoxLayout(dlg)
-        lay.addWidget(QLabel("每个账户对应一个平台（如支付宝、天天基金、招行等）。"))
+        _m_lbl = QLabel("每个账户对应一个平台（如支付宝、天天基金、招行等）。")
+        _m_lbl.setStyleSheet(f"color:{T()['muted']};"); lay.addWidget(_m_lbl)
         list_box = QVBoxLayout(); lay.addLayout(list_box)
         def rebuild():
             while list_box.count():
@@ -2057,13 +2299,14 @@ class HoldDialog(QDialog):
                 # 旧行控件删不掉变幽灵行（v1.1 修复：重复显示/删后残留）
                 roww = QWidget()
                 row = QHBoxLayout(roww); row.setContentsMargins(0,2,0,2)
-                lb = QLabel(a); lb.setFont(QFont(FONT, 10))
+                lb = QLabel(a); lb.setFont(QFont(FONT, 10)); lb.setStyleSheet(f"color:{T()['text']};")
                 row.addWidget(lb, 1)
                 if a != DEFAULT_ACCOUNT:
                     btn_rename = QPushButton("改名")
+                    btn_rename.setStyleSheet(ghost_btn_qss(T(), pad="3px 10px"))
                     btn_rename.clicked.connect(lambda _, x=a: do_rename(x))
                     btn_del = QPushButton("删除")
-                    btn_del.setStyleSheet("color:#b3261e;")
+                    btn_del.setStyleSheet(danger_btn_qss(T(), pad="3px 10px"))
                     btn_del.clicked.connect(lambda _, x=a: do_delete(x))
                     row.addWidget(btn_rename); row.addWidget(btn_del)
                 list_box.addWidget(roww)
@@ -2108,8 +2351,8 @@ class HoldDialog(QDialog):
                 self._load_for_account()
             rebuild()
         add_bar = QHBoxLayout()
-        ed_new = QLineEdit(); ed_new.setPlaceholderText("新账户名称")
-        btn_add = QPushButton("➕ 添加")
+        ed_new = QLineEdit(); ed_new.setPlaceholderText("新账户名称"); ed_new.setStyleSheet(input_qss())
+        btn_add = QPushButton("添加"); btn_add.setStyleSheet(soft_btn_qss())
         def do_add():
             n = ed_new.text().strip()
             if not n: return
@@ -2121,6 +2364,7 @@ class HoldDialog(QDialog):
         add_bar.addWidget(ed_new, 1); add_bar.addWidget(btn_add)
         lay.addLayout(add_bar)
         btn_close = QPushButton("关闭"); btn_close.clicked.connect(dlg.accept)
+        btn_close.setStyleSheet(primary_btn_qss())
         lay.addWidget(btn_close)
         rebuild()
         dlg.exec()
@@ -2249,7 +2493,7 @@ class TradeDialog(QDialog):
 
         tip = QLabel("口径：15:00 前提交按【当天】净值确认，15:00 后/节假日按【下一交易日】净值确认。\n补录历史交易：日期填确认净值对应的交易日，净值/份额照抄支付宝交易详情即可。\n分红：现金分红只记金额（计入当日收益）；红利再投记金额+份额（份额并入持仓）。")
         tip.setWordWrap(True)
-        tip.setStyleSheet("color:#888; font-size:11px;")
+        tip.setStyleSheet(f"color:{T()['muted']}; font-size:11px;")
         L.addWidget(tip)
 
         H = QHBoxLayout()
@@ -2260,7 +2504,7 @@ class TradeDialog(QDialog):
         self.rb_divr = QRadioButton("红利再投")
         (self.rb_buy if kind == "buy" else self.rb_sell).setChecked(True)
         for _rb in (self.rb_buy, self.rb_sell, self.rb_conv, self.rb_divc, self.rb_divr):
-            H.addWidget(_rb)
+            _rb.setStyleSheet(f"color:{T()['text']};"); H.addWidget(_rb)
         H.addStretch()
         L.addLayout(H)
 
@@ -2268,20 +2512,25 @@ class TradeDialog(QDialog):
         self.cb_account = QComboBox()
         for a in load_accounts():
             self.cb_account.addItem(a)
+        self.cb_account.setStyleSheet(combo_qss())
         F.addRow("账户", self.cb_account)
         self.ed_date = QDateEdit(QDate.currentDate())
         self.ed_date.setCalendarPopup(True)
         self.ed_date.setDisplayFormat("yyyy-MM-dd")
+        self.ed_date.setStyleSheet(input_qss())
         F.addRow("交易日期", self.ed_date)
         self.ed_amt = QLineEdit()
         self.ed_amt.setPlaceholderText("买入=花的钱 卖出=到账的钱")
+        self.ed_amt.setStyleSheet(input_qss())
         F.addRow("金额(元)", self.ed_amt)
         self.ed_share = QLineEdit()
         self.ed_share.setPlaceholderText("选填：可直接抄支付宝【确认份额】；不填按 金额÷净值 算")
+        self.ed_share.setStyleSheet(input_qss())
         F.addRow("份额", self.ed_share)
         self.ed_price = QLineEdit()
         p0 = self._price.get(code, 0)
         if p0 > 0: self.ed_price.setText(f"{p0:.4f}")
+        self.ed_price.setStyleSheet(input_qss())
         F.addRow("成交净值", self.ed_price)
         L.addLayout(F)
 
@@ -2290,8 +2539,10 @@ class TradeDialog(QDialog):
         self.cb_to = QComboBox()
         for c, n in FUNDS:
             if c != code: self.cb_to.addItem(f"{n}（{c}）", c)
+        self.cb_to.setStyleSheet(combo_qss())
         self.ed_to_share = QLineEdit()
         self.ed_to_share.setPlaceholderText("选填：不填按 转出金额÷转入净值 算")
+        self.ed_to_share.setStyleSheet(input_qss())
         tf.addRow("转入基金", self.cb_to); tf.addRow("转入份额", self.ed_to_share)
         self.w_to.hide()
         L.addWidget(self.w_to)
@@ -2299,15 +2550,17 @@ class TradeDialog(QDialog):
 
         self.lbl_hint = QLabel("")
         self.lbl_hint.setWordWrap(True)
-        self.lbl_hint.setStyleSheet("color:#8a6d00; background:#fff8e1; padding:4px; border-radius:4px;")
+        self.lbl_hint.setStyleSheet(panel_label_qss("warn"))
         self.lbl_hint.hide()
         L.addWidget(self.lbl_hint)
 
         BB = QHBoxLayout()
         btn_ok = QPushButton("确定")
         btn_ok.clicked.connect(self._try_accept)
+        btn_ok.setStyleSheet(primary_btn_qss())
         btn_cancel = QPushButton("取消")
         btn_cancel.clicked.connect(self.reject)
+        btn_cancel.setStyleSheet(ghost_btn_qss())
         BB.addStretch(); BB.addWidget(btn_ok); BB.addWidget(btn_cancel)
         L.addLayout(BB)
 
@@ -2445,31 +2698,32 @@ class PnlDialog(QDialog):
        起点=第一笔交易/最早买入日期(之前不记录)；休市日=0；清仓后=0。"""
     def __init__(self, parent):
         super().__init__(parent)
-        self.setWindowTitle("📅 收益明细"); self.resize(900, 720)
+        self.setWindowTitle("收益明细"); self.resize(900, 720)
         self._hist = {}; self._days = []; self._sel = None
         self._ym = (datetime.now().year, datetime.now().month)
         self._worker = None; self._account_filter = "__all__"
+        t = T()
         L = QVBoxLayout(self); L.setSpacing(8)
         tip = QLabel("口径：当日盈亏 = Σ 当日持有份额 ×（当日净值 − 前一日净值），份额按交易记录逐日回溯。从第一笔交易/买入日期开始记录，之前不计；休市日收益为 0；全部卖出后为 0。无交易记录且未填买入日期的基金，从起点按当前份额近似（仅供参考）。")
-        tip.setWordWrap(True); tip.setStyleSheet("color:#888;font-size:10px;"); L.addWidget(tip)
+        tip.setWordWrap(True); tip.setStyleSheet(f"color:{t['muted']};font-size:10px;"); L.addWidget(tip)
         # 账户筛选
         acc_bar = QHBoxLayout()
-        acc_bar.addWidget(QLabel("账户筛选："))
+        _af_lbl = QLabel("账户筛选："); _af_lbl.setStyleSheet(f"color:{t['muted']};"); acc_bar.addWidget(_af_lbl)
         self._acc_filter = QComboBox()
         self._acc_filter.addItem("全部账户", "__all__")
         for a in load_accounts():
             self._acc_filter.addItem(a, a)
         self._acc_filter.currentIndexChanged.connect(self._on_filter_changed)
-        acc_bar.addWidget(self._acc_filter)
+        self._acc_filter.setStyleSheet(combo_qss(t)); acc_bar.addWidget(self._acc_filter)
         acc_bar.addStretch()
         L.addLayout(acc_bar)
-        ov = QFrame(); ov.setStyleSheet("QFrame{background:#f7f9fc;border-radius:10px;}")
+        ov = QFrame(); ov.setStyleSheet(panel_qss())
         ol = QHBoxLayout(ov); ol.setContentsMargins(14,10,14,10)
         self._ov_lbls = {}
         for key, name in (("yest","昨日收益"), ("month","本月收益"), ("monthpct","本月收益率"), ("year","本年累计")):
             box = QVBoxLayout(); box.setSpacing(2)
-            a = QLabel(name); a.setStyleSheet("color:#888;font-size:9px;"); a.setAlignment(Qt.AlignCenter)
-            b = QLabel("—"); b.setFont(QFont(FONT,13,QFont.Bold)); b.setAlignment(Qt.AlignCenter)
+            a = QLabel(name); a.setStyleSheet(f"color:{t['muted']};font-size:9px;"); a.setAlignment(Qt.AlignCenter)
+            b = QLabel("—"); b.setFont(QFont(FONT,13,QFont.Bold)); b.setAlignment(Qt.AlignCenter); b.setStyleSheet(f"color:{t['text']};")
             box.addWidget(a); box.addWidget(b); ol.addLayout(box)
             self._ov_lbls[key] = b
         L.addWidget(ov)
@@ -2477,13 +2731,14 @@ class PnlDialog(QDialog):
         self.btn_prev = QPushButton("‹"); self.btn_next = QPushButton("›")
         for b in (self.btn_prev, self.btn_next):
             b.setFixedWidth(34); b.setFont(QFont(FONT,11,QFont.Bold))
-            b.setStyleSheet("QPushButton{border-radius:7px;background:#f0f0f0;}QPushButton:hover{background:#e3e3e3;}")
+            b.setStyleSheet(ghost_btn_qss(t, pad="4px 0px"))
         self.btn_prev.clicked.connect(lambda: self._shift(-1)); self.btn_next.clicked.connect(lambda: self._shift(1))
         self.lbl_month = QLabel(""); self.lbl_month.setFont(QFont(FONT,12,QFont.Bold)); self.lbl_month.setAlignment(Qt.AlignCenter)
+        self.lbl_month.setStyleSheet(f"color:{t['text']};")
         nav.addWidget(self.btn_prev); nav.addWidget(self.lbl_month,1); nav.addWidget(self.btn_next); L.addLayout(nav)
         self.grid = QGridLayout(); self.grid.setSpacing(4)
-        for c, t in enumerate(("日","一","二","三","四","五","六")):
-            h = QLabel(t); h.setAlignment(Qt.AlignCenter); h.setStyleSheet("color:#666;font-weight:bold;")
+        for c, wt in enumerate(("日","一","二","三","四","五","六")):
+            h = QLabel(wt); h.setAlignment(Qt.AlignCenter); h.setStyleSheet(f"color:{t['muted']};font-weight:bold;")
             self.grid.addWidget(h, 0, c)
         self._cells = []
         for r in range(6):
@@ -2496,17 +2751,17 @@ class PnlDialog(QDialog):
             self._cells.append(row)
         L.addLayout(self.grid)
         self.lbl_day = QLabel("点日历上某一天，看每只基金当天贡献 ↓")
-        self.lbl_day.setFont(QFont(FONT,10,QFont.Bold)); self.lbl_day.setStyleSheet("color:#333;")
+        self.lbl_day.setFont(QFont(FONT,10,QFont.Bold)); self.lbl_day.setStyleSheet(f"color:{t['text']};")
         L.addWidget(self.lbl_day)
         self.tbl = QTableWidget(0,4); self.tbl.setHorizontalHeaderLabels(["基金","当日盈亏(元)","当日涨跌","备注"])
         self.tbl.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch)
         self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers); self.tbl.verticalHeader().setVisible(False)
-        self.tbl.setAlternatingRowColors(True); self.tbl.setStyleSheet("QTableWidget{font-size:12px;}")
+        self.tbl.setAlternatingRowColors(True); self.tbl.setStyleSheet(table_qss("font-size:12px;"))
         L.addWidget(self.tbl,1)
-        self.lbl_status = QLabel(""); self.lbl_status.setStyleSheet("color:#888;font-size:10px;"); L.addWidget(self.lbl_status)
+        self.lbl_status = QLabel(""); self.lbl_status.setStyleSheet(f"color:{t['muted']};font-size:10px;"); L.addWidget(self.lbl_status)
         bb = QHBoxLayout(); bb.addStretch()
         b = QPushButton("关闭"); b.clicked.connect(self.reject)
-        b.setStyleSheet("QPushButton{padding:8px 16px;border-radius:8px;background:#2563eb;color:#fff;border:none;}")
+        b.setStyleSheet(primary_btn_qss(t))
         bb.addWidget(b); L.addLayout(bb)
 
     def start(self):
@@ -2645,7 +2900,7 @@ class PnlDialog(QDialog):
     def _set_ov(self, key, val, pct=False):
         lb = self._ov_lbls[key]
         if val is None:
-            lb.setText("—"); lb.setStyleSheet("color:#888;font-weight:bold;"); return
+            lb.setText("—"); lb.setStyleSheet(f"color:{T()['muted']};font-weight:bold;"); return
         lb.setText(f"{val:+.2f}%" if pct else f"{val:+,.2f}")
         lb.setStyleSheet(f"color:{RED if val>=0 else GREEN};font-weight:bold;")
 
@@ -2679,23 +2934,25 @@ class PnlDialog(QDialog):
         wd, ndays = _cal.monthrange(y, m)
         first_wd = (wd + 1) % 7      # monthrange 周一=0 → 日历列 周日=0
         today = datetime.now().strftime("%Y-%m-%d")
+        t = T()  # v2.0.0：日历格子全主题适配（底色混合而非固定浅色）
+        _empty = f"QLabel{{background:{t['panel_bg']};border-radius:8px;color:{t['faint']};}}"
         for row in self._cells:
             for cell in row:
-                cell.setText(""); cell.setProperty("ds", ""); cell.setStyleSheet("QLabel{background:#fafafa;border-radius:8px;color:#ddd;}")
+                cell.setText(""); cell.setProperty("ds", ""); cell.setStyleSheet(_empty)
         for d in range(1, ndays+1):
             ds = f"{y:04d}-{m:02d}-{d:02d}"; idx = first_wd + d - 1
             cell = self._cells[idx//7][idx%7]; cell.setProperty("ds", ds)
             if getattr(self, "_start", "") and ds < self._start:
-                cell.setText(f"{d}\n—"); cell.setStyleSheet("QLabel{background:#fafafa;border-radius:8px;color:#ccc;}")
+                cell.setText(f"{d}\n—"); cell.setStyleSheet(_empty)
             elif ds in day_pnl and abs(day_pnl[ds]) > 1e-9:
                 v = day_pnl[ds]; a = min(abs(v)/vmax, 1.0)
-                bg = f"rgba(229,57,53,{0.10+0.55*a:.2f})" if v >= 0 else f"rgba(22,163,74,{0.10+0.55*a:.2f})"
+                bg = blend_color(t["card_bg"], t["up"] if v >= 0 else t["down"], 0.18+0.45*a)
                 cell.setText(f"{d}\n{v:+.2f}")
-                cell.setStyleSheet(f"QLabel{{background:{bg};border-radius:8px;color:{RED if v>=0 else GREEN};font-weight:bold;}}QLabel:hover{{border:2px solid #2563eb;}}")
+                cell.setStyleSheet(f"QLabel{{background:{bg};border-radius:8px;color:{t['text']};font-weight:bold;}}QLabel:hover{{border:2px solid {t['accent']};}}")
             elif (idx % 7) in (0, 6) or ds < today:
-                cell.setText(f"{d}\n0.00"); cell.setStyleSheet("QLabel{background:#f5f5f5;border-radius:8px;color:#999;}QLabel:hover{border:2px solid #2563eb;}")
+                cell.setText(f"{d}\n0.00"); cell.setStyleSheet(f"QLabel{{background:{t['hover_bg']};border-radius:8px;color:{t['muted']};}}QLabel:hover{{border:2px solid {t['accent']};}}")
             else:
-                cell.setText(f"{d}\n—"); cell.setStyleSheet("QLabel{background:#fafafa;border-radius:8px;color:#ccc;}")
+                cell.setText(f"{d}\n—"); cell.setStyleSheet(_empty)
         if self._sel and self._sel[:7] == f"{y:04d}-{m:02d}": self._show_day(self._sel)
 
     def _click(self, r, c):
@@ -2736,36 +2993,43 @@ class TradesDialog(QDialog):
         self.setWindowTitle("交易记录")
         self.resize(780, 560)
         root = QVBoxLayout(self)
-        root.addWidget(QLabel("补录＝把支付宝里过去的交易抄进来，只影响收益日历，不影响当前持仓。份额必填（照抄支付宝「确认份额」），金额选填。"))
+        _t_lbl = QLabel("补录＝把支付宝里过去的交易抄进来，只影响收益日历，不影响当前持仓。份额必填（照抄支付宝「确认份额」），金额选填。")
+        _t_lbl.setStyleSheet(f"color:{T()['text_sub']};"); root.addWidget(_t_lbl)
 
         self.tbl = QTableWidget(0, 6)
         self.tbl.setHorizontalHeaderLabels(["日期", "基金", "类型", "金额(元)", "份额", "账户"])
         self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.tbl.setStyleSheet(table_qss())
         root.addWidget(self.tbl, 1)
 
         form = QFormLayout()
         self.d_date = QDateEdit(QDate.currentDate())
         self.d_date.setCalendarPopup(True); self.d_date.setDisplayFormat("yyyy-MM-dd")
+        self.d_date.setStyleSheet(input_qss())
         self.d_code = QComboBox()
         for c in sorted(NAME_MAP, key=lambda c: NAME_MAP[c]):
             self.d_code.addItem(f"{NAME_MAP[c]}（{c}）", c)
+        self.d_code.setStyleSheet(combo_qss())
         self.d_side = QComboBox()
         for k, v in self.SIDES:
             self.d_side.addItem(v, k)
+        self.d_side.setStyleSheet(combo_qss())
         self.d_account = QComboBox()
         for a in load_accounts():
             self.d_account.addItem(a)
-        self.d_shares = QLineEdit(); self.d_shares.setPlaceholderText("必填：支付宝里的确认份额")
-        self.d_amount = QLineEdit(); self.d_amount.setPlaceholderText("选填：金额(元)")
+        self.d_account.setStyleSheet(combo_qss())
+        self.d_shares = QLineEdit(); self.d_shares.setPlaceholderText("必填：支付宝里的确认份额"); self.d_shares.setStyleSheet(input_qss())
+        self.d_amount = QLineEdit(); self.d_amount.setPlaceholderText("选填：金额(元)"); self.d_amount.setStyleSheet(input_qss())
         form.addRow("日期", self.d_date);  form.addRow("基金", self.d_code)
         form.addRow("类型", self.d_side);  form.addRow("账户", self.d_account)
         form.addRow("份额", self.d_shares); form.addRow("金额", self.d_amount)
         root.addLayout(form)
 
         bar = QHBoxLayout()
-        b_add = QPushButton("➕ 补录一笔"); b_del = QPushButton("🗑 删除选中行")
+        b_add = QPushButton("补录一笔"); b_del = QPushButton("删除选中行")
+        b_add.setStyleSheet(soft_btn_qss()); b_del.setStyleSheet(danger_btn_qss())
         b_add.clicked.connect(self._add); b_del.clicked.connect(self._del)
         bar.addWidget(b_add); bar.addWidget(b_del); bar.addStretch()
         root.addLayout(bar)
@@ -2916,47 +3180,49 @@ class ExportDialog(QDialog):
                 ("pnl", "收益明细"), ("snapshot", "行情快照")]
 
     def __init__(self, parent=None):
-        super().__init__(parent); self.setWindowTitle("📥 导出 Excel"); self.resize(520, 380)
+        super().__init__(parent); self.setWindowTitle("导出 Excel"); self.resize(520, 380)
         self._parent = parent
         lay = QVBoxLayout(self); lay.setSpacing(12)
-        lay.addWidget(QLabel("勾选要导出的数据，选好保存路径，点「导出」生成一个 xlsx 文件（每个数据一个 sheet）。"))
+        _e_lbl = QLabel("勾选要导出的数据，选好保存路径，点「导出」生成一个 xlsx 文件（每个数据一个 sheet）。")
+        _e_lbl.setStyleSheet(f"color:{T()['text_sub']};"); lay.addWidget(_e_lbl)
         # 复选框
         self._checks = {}
         pnl = getattr(parent, "_pnl_dialog", None)
         has_pnl = bool(pnl) and bool(getattr(pnl, "_hist", None))
         for key, title in self.SECTIONS:
             cb = QCheckBox(title); cb.setFont(QFont(FONT, 10))
+            cb.setStyleSheet(f"color:{T()['text']};")
             if key == "pnl" and not has_pnl:
                 cb.setEnabled(False)
-                cb.setToolTip("请先打开「📅 收益明细」并等待抓取完成，再回来导出")
+                cb.setToolTip("请先打开「收益明细」并等待抓取完成，再回来导出")
                 cb.setText(f"{title}（需先打开收益明细）")
             elif key == "snapshot" and not getattr(parent, "last_results", None):
-                cb.setToolTip("点「🔄 刷新数据」后再导出")
+                cb.setToolTip("点「刷新数据」后再导出")
             cb.setChecked(key != "pnl" or has_pnl)
             lay.addWidget(cb); self._checks[key] = cb
         # 路径选择
         path_row = QHBoxLayout()
-        path_row.addWidget(QLabel("保存到："))
+        _sv_lbl = QLabel("保存到："); _sv_lbl.setStyleSheet(f"color:{T()['muted']};"); path_row.addWidget(_sv_lbl)
         self._ed_path = QLineEdit()
         default_name = f"基金日报导出_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         self._ed_path.setText(os.path.join(_BASE, default_name))
-        self._ed_path.setStyleSheet("QLineEdit{padding:6px 8px;border:1px solid #ddd;border-radius:7px;}")
+        self._ed_path.setStyleSheet(input_qss())
         path_row.addWidget(self._ed_path, 1)
         b_browse = QPushButton("浏览…")
         b_browse.clicked.connect(self._browse)
-        b_browse.setStyleSheet("QPushButton{padding:6px 12px;border-radius:7px;background:#f0f0f0;border:none;}QPushButton:hover{background:#e3e3e3;}")
+        b_browse.setStyleSheet(ghost_btn_qss(T(), pad="6px 12px"))
         path_row.addWidget(b_browse)
         lay.addLayout(path_row)
         # 状态
         self._lbl_status = QLabel(""); self._lbl_status.setWordWrap(True)
-        self._lbl_status.setStyleSheet("color:#888;"); lay.addWidget(self._lbl_status)
+        self._lbl_status.setStyleSheet(f"color:{T()['muted']};"); lay.addWidget(self._lbl_status)
         # 按钮
         bar = QHBoxLayout(); bar.addStretch()
         b_cancel = QPushButton("取消"); b_cancel.clicked.connect(self.reject)
-        b_cancel.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#f0f0f0;border:none;}")
+        b_cancel.setStyleSheet(ghost_btn_qss())
         bar.addWidget(b_cancel)
-        b_export = QPushButton("📥 导出"); b_export.clicked.connect(self._do_export)
-        b_export.setStyleSheet("QPushButton{padding:8px 16px;border-radius:8px;background:#0891b2;color:#fff;border:none;}QPushButton:hover{background:#0e7490;}QPushButton:disabled{background:#bbb;}")
+        b_export = QPushButton("导出"); b_export.clicked.connect(self._do_export)
+        b_export.setStyleSheet(primary_btn_qss())
         bar.addWidget(b_export); lay.addLayout(bar)
         self._b_export = b_export
 
@@ -2995,11 +3261,35 @@ class ExportDialog(QDialog):
             self._b_export.setEnabled(True)
 
 
+class SettingsDialog(QDialog):
+    """v1.7：设置对话框（外观组：主题切换）。完整分组设置中心见 3.0.0。"""
+    def __init__(self, parent=None):
+        super().__init__(parent); self.setWindowTitle("设置"); self.resize(470, 210)
+        lay = QVBoxLayout(self); lay.setContentsMargins(16,14,16,14); lay.setSpacing(10)
+        grp = QLabel("外观"); grp.setFont(QFont(FONT, 11, QFont.Bold)); lay.addWidget(grp)
+        row = QHBoxLayout()
+        lab = QLabel("应用主题"); lab.setFont(QFont(FONT, 10)); row.addWidget(lab)
+        self.combo = QComboBox(); self.combo.setFont(QFont(FONT, 10))
+        for k, t in THEMES.items(): self.combo.addItem(t["name"], k)
+        ix = self.combo.findData(_THEME)
+        if ix >= 0: self.combo.setCurrentIndex(ix)
+        row.addWidget(self.combo, 1); lay.addLayout(row)
+        hint = QLabel("主题切换立即生效并记住。四套主题均已全屏适配（顶栏/卡片/榜单/详情页/弹窗）。")
+        hint.setFont(QFont(FONT, 8)); hint.setStyleSheet(f"color:{T()['muted']};"); hint.setWordWrap(True); lay.addWidget(hint)
+        lay.addStretch()
+        brow = QHBoxLayout(); brow.addStretch()
+        ok = QPushButton("确定"); ok.clicked.connect(self.accept)
+        canc = QPushButton("取消"); canc.clicked.connect(self.reject)
+        brow.addWidget(ok); brow.addWidget(canc); lay.addLayout(brow)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__(); self.setWindowTitle("基金日报"); self.resize(1320,900)
         s = QApplication.primaryScreen().geometry(); self.move(max(0,(s.width()-1320)//2),max(0,(s.height()-900)//2))
         pg.setConfigOptions(antialias=True)
+        set_theme((load_settings() or {}).get("theme", "b_dark"))  # v2.0.0：默认主题=深空暗（FD-HIG 定案），老用户设置优先
+        self._apply_global_qss()
         root = QWidget(); self.setCentralWidget(root)
         outer = QVBoxLayout(root); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
         self.stack = QStackedWidget(); outer.addWidget(self.stack)
@@ -3027,114 +3317,127 @@ class MainWindow(QMainWindow):
             import webbrowser; webbrowser.open(url)
 
     def _build_home(self):
-        w = QWidget(); outer = QVBoxLayout(w); outer.setContentsMargins(18,16,18,16); outer.setSpacing(12)
-        top = QHBoxLayout()
-        title = QLabel("📊  基金日报"); title.setFont(QFont(FONT,16,QFont.Bold)); top.addWidget(title); top.addStretch()
-        ver = QLabel(f"v{APP_VERSION}"); ver.setFont(QFont(FONT, 9)); ver.setStyleSheet("color:#999;")
-        top.addWidget(ver)
-        self.lbl_time = QLabel(""); self.lbl_time.setStyleSheet("color:#999;"); top.addWidget(self.lbl_time)
-        top.addWidget(QLabel("账户:"))
+        w = QWidget(); w.setObjectName("homeRoot"); w.setAutoFillBackground(True)  # v1.7：主题窗口底
+        _t0 = T()
+        if _t0["win_bg"]: w.setStyleSheet(f"#homeRoot{{background:{_t0['win_bg']};}}")
+        self._home_root = w
+        outer = QVBoxLayout(w); outer.setContentsMargins(18,16,18,16); outer.setSpacing(12)
+        top = QHBoxLayout(); top.setSpacing(8)
+        t = T()
+        # v2.0.0 顶栏（FD-HIG 层级铁律）：标识+标题+徽章 ｜ 账户下拉 ｜ 幽灵导航 ｜ 图标工具 ｜ 唯一主按钮
+        self._logo_lbl = QLabel(); self._logo_lbl.setPixmap(icon_pixmap("logo", t["accent"], 26))
+        top.addWidget(self._logo_lbl)
+        self._title_lbl = QLabel("基金日报"); self._title_lbl.setFont(QFont(FONT,15,QFont.Bold)); self._title_lbl.setStyleSheet(f"color:{t['text']};")
+        top.addWidget(self._title_lbl)
+        self._ver_lbl = QLabel(f"v{APP_VERSION}"); self._ver_lbl.setFont(QFont(FONT,8))
+        self._ver_lbl.setStyleSheet(f"color:{t['muted']};border:1px solid {t['card_border']};border-radius:4px;padding:1px 5px;")
+        top.addWidget(self._ver_lbl)
+        self.lbl_time = QLabel(""); self.lbl_time.setStyleSheet(f"color:{t['muted']};"); top.addWidget(self.lbl_time)
+        top.addSpacing(8)
+        self._acc_lbl = QLabel("账户"); self._acc_lbl.setStyleSheet(f"color:{t['muted']};"); top.addWidget(self._acc_lbl)
         self._account_combo = QComboBox()
         self._account_combo.addItem("全部账户", "__all__")
         for _a in load_accounts():
             self._account_combo.addItem(_a, _a)
         self._account_combo.currentIndexChanged.connect(self._on_account_changed)
+        self._account_combo.setStyleSheet(f"QComboBox{{padding:5px 10px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}")
         top.addWidget(self._account_combo)
-        self.btn_hold = QPushButton("💼 管理持仓"); self.btn_hold.setFont(QFont(FONT,9))
-        self.btn_hold.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef9f0;color:#16a34a;border:none;}QPushButton:hover{background:#dcf3e1;}")
-        self.btn_hold.clicked.connect(self._open_hold); top.addWidget(self.btn_hold)
-        self.btn_diag = QPushButton("🩺 诊断"); self.btn_diag.setFont(QFont(FONT,9))
-        self.btn_diag.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#f0f0f0;border:none;}QPushButton:hover{background:#e3e3e3;}")
-        self.btn_diag.clicked.connect(self._show_diag); top.addWidget(self.btn_diag)
-        self.btn_pnl = QPushButton("📅 收益明细"); self.btn_pnl.setFont(QFont(FONT,9))
-        self.btn_pnl.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#fff7ed;color:#ea580c;border:none;}QPushButton:hover{background:#ffedd5;}")
-        self.btn_pnl.clicked.connect(self._open_pnl); top.addWidget(self.btn_pnl)
-        self.btn_trades = QPushButton("📒 交易记录")
-        self.btn_trades.clicked.connect(lambda: TradesDialog(self).exec());top.addWidget(self.btn_trades)
-        self.btn_trades.setFont(QFont(FONT,9))
-        self.btn_trades.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#eef2ff;color:#4f46e5;border:none;}QPushButton:hover{background:#e0e7ff;}")
-        self.btn_export = QPushButton("📥 导出")
-        self.btn_export.clicked.connect(self._open_export); top.addWidget(self.btn_export)
-        self.btn_export.setFont(QFont(FONT,9))
-        self.btn_export.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#ecfeff;color:#0891b2;border:none;}QPushButton:hover{background:#cffafe;}")
-        self.btn_backup = QPushButton("🗄 备份")
-        self.btn_backup.clicked.connect(self._open_backup); top.addWidget(self.btn_backup)
-        self.btn_backup.setFont(QFont(FONT,9))
-        self.btn_backup.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#fef3c7;color:#92400e;border:none;}QPushButton:hover{background:#fde68a;}")
-        self.btn_about = QPushButton("ℹ 关于")
-        self.btn_about.clicked.connect(self._open_about); top.addWidget(self.btn_about)
-        self.btn_about.setFont(QFont(FONT,9))
-        self.btn_about.setStyleSheet("QPushButton{padding:8px 12px;border-radius:8px;background:#f5f5f5;color:#555;border:none;}QPushButton:hover{background:#e8e8e8;}")
-        # 「📸 最新快照」按钮已随 OCR 一并移除
-        self.btn_refresh = QPushButton("🔄  刷新数据"); self.btn_refresh.setFont(QFont(FONT,10))
-        self.btn_refresh.setStyleSheet("QPushButton{padding:9px 16px;border-radius:8px;background:#2563eb;color:#fff;border:none;}QPushButton:hover{background:#1d4ed8;}QPushButton:disabled{background:#bbb;}")
+        top.addSpacing(6)
+        # 导航群：统一幽灵按钮（去彩虹/去 emoji，手绘图标+文字）
+        self._tb_navs = []
+        for _k, _txt, _slot in (("hold","管理持仓",self._open_hold),("pnl","收益明细",self._open_pnl),
+                                ("trades","交易记录",lambda: TradesDialog(self).exec()),("diag","诊断",self._show_diag)):
+            _b = QPushButton(QIcon(icon_pixmap(_k, t["muted"], 15)), "  " + _txt)
+            _b.setFont(QFont(FONT,9)); _b.clicked.connect(_slot); _b.setStyleSheet(ghost_btn_qss(t))
+            self._tb_navs.append((_b, _k, _txt)); top.addWidget(_b)
+        self.btn_hold, self.btn_pnl, self.btn_trades, self.btn_diag = [x[0] for x in self._tb_navs]  # 旧属性兼容
+        top.addStretch()
+        # 工具群：纯图标小按钮归组最右（悬停显名）
+        self._tb_tools = []
+        for _k, _tip, _slot in (("export","导出",self._open_export),("backup","备份",self._open_backup),
+                                ("about","关于",self._open_about),("settings","设置",self._open_settings)):
+            _b = QPushButton(QIcon(icon_pixmap(_k, t["muted"], 15)), "")
+            _b.setFixedSize(30,30); _b.setToolTip(_tip); _b.clicked.connect(_slot)
+            _b.setStyleSheet(ghost_btn_qss(t, pad="0px")); self._tb_tools.append((_b, _k)); top.addWidget(_b)
+        self.btn_export, self.btn_backup, self.btn_about, self.btn_settings = [x[0] for x in self._tb_tools]
+        # 主操作：全顶栏唯一强调色实底按钮
+        self.btn_refresh = QPushButton(QIcon(icon_pixmap("refresh", "#ffffff", 15)), "  刷新数据"); self.btn_refresh.setFont(QFont(FONT,10,QFont.Bold))
+        self.btn_refresh.setStyleSheet(primary_btn_qss(t))
         self.btn_refresh.clicked.connect(self._refresh_home); top.addWidget(self.btn_refresh); outer.addLayout(top)
-        self.summary = QFrame(); self.summary.setStyleSheet("QFrame{background:#f7f9fc;border-radius:10px;}")
+        self.summary = QFrame(); self.summary.setStyleSheet(panel_qss())  # v1.7 令牌化
         sl = QHBoxLayout(self.summary); sl.setContentsMargins(16,12,16,12)
         self.lbl_total = QLabel("总持仓市值  —"); self.lbl_total.setFont(QFont(FONT,11,QFont.Bold))
         self.lbl_today = QLabel("今日盈亏  —"); self.lbl_today.setFont(QFont(FONT,11,QFont.Bold))
         self.lbl_cum = QLabel("累计收益  —"); self.lbl_cum.setFont(QFont(FONT,11,QFont.Bold))  # v1.2：总市值-总本金
         sl.addWidget(self.lbl_total); sl.addStretch(); sl.addWidget(self.lbl_today)
-        _sep = QLabel("｜"); _sep.setStyleSheet("color:#ccc;"); sl.addWidget(_sep)
+        _sep = QLabel("｜"); _sep.setStyleSheet(f"color:{T()['faint']};"); sl.addWidget(_sep)
         sl.addWidget(self.lbl_cum); outer.addWidget(self.summary)
-        self.lbl_fix = QLabel(""); self.lbl_fix.setStyleSheet("QLabel{color:#9a6b00;background:#fff7d6;border:1px solid #f0d97a;border-radius:8px;padding:8px 12px;}")
+        t = T()
+        self.lbl_fix = QLabel(""); self.lbl_fix.setStyleSheet(f"QLabel{{color:{t['mid_val']};background:{t['hover_bg']};border:1px solid {t['card_border']};border-radius:8px;padding:8px 12px;}}")
         self.lbl_fix.setWordWrap(True); self.lbl_fix.hide(); outer.addWidget(self.lbl_fix)
-        self.lbl_alert = QLabel(""); self.lbl_alert.setStyleSheet("QLabel{color:#b3261e;background:#fdecea;border:1px solid #f5b7b1;border-radius:8px;padding:8px 12px;}")
+        self.lbl_alert = QLabel(""); self.lbl_alert.setStyleSheet(f"QLabel{{color:{t['up']};background:{t['hover_bg']};border:1px solid {t['card_border']};border-radius:8px;padding:8px 12px;}}")
         self.lbl_alert.setWordWrap(True); self.lbl_alert.hide(); outer.addWidget(self.lbl_alert)
         self.lbl_noacc = QLabel("")  # v1.2：无持仓账户引导
-        self.lbl_noacc.setStyleSheet("QLabel{color:#1565c0;background:#e3f2fd;border:1px solid #90caf9;border-radius:8px;padding:8px 12px;font-size:12px;}")
+        self.lbl_noacc.setStyleSheet(f"QLabel{{color:{t['accent']};background:{t['accent_soft']};border:1px solid {t['accent_soft_hover']};border-radius:8px;padding:8px 12px;font-size:12px;}}")
         self.lbl_noacc.setWordWrap(True); self.lbl_noacc.hide(); outer.addWidget(self.lbl_noacc)
-        self.lbl_empty = QLabel("👋 看板还是空的：在左上方『➕ 快速添加』输入 6 位基金代码，添加第一只基金后，这里就会变成你的持仓看板。")
-        self.lbl_empty.setStyleSheet("QLabel{color:#1565c0;background:#e3f2fd;border:1px solid #90caf9;border-radius:10px;padding:14px 16px;font-size:12px;}")
+        self.lbl_empty = QLabel("看板还是空的：在左上方『快速添加』输入 6 位基金代码，添加第一只基金后，这里就会变成你的持仓看板。")
+        self.lbl_empty.setStyleSheet(f"QLabel{{color:{t['accent']};background:{t['accent_soft']};border:1px solid {t['accent_soft_hover']};border-radius:10px;padding:14px 16px;font-size:12px;}}")
         self.lbl_empty.setWordWrap(True); outer.addWidget(self.lbl_empty)
         split = QSplitter(Qt.Horizontal)
+        split.setHandleWidth(2)  # v2.0.0：分栏手柄收窄并主题化（修“中间白条”）
         left_scroll = QScrollArea(); left_scroll.setWidgetResizable(True); left_scroll.setMinimumWidth(380)
         left_scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        left_scroll.viewport().setStyleSheet("background:transparent;")  # v2.0.0：同上，视口透明
         left_wrap = QWidget(); left_col = QVBoxLayout(left_wrap); left_col.setContentsMargins(0,0,0,0); left_col.setSpacing(10)
-        add_box = QFrame(); add_box.setStyleSheet("QFrame{background:#fff;border:1px solid #eee;border-radius:10px;}")
+        add_box = QFrame(); add_box.setStyleSheet(board_qss())
+        self._add_box = add_box
         abl = QHBoxLayout(add_box); abl.setContentsMargins(12,10,12,10)
-        atitle = QLabel("➕ 快速添加"); atitle.setFont(QFont(FONT,9,QFont.Bold)); abl.addWidget(atitle)
-        self._add_input = QLineEdit(); self._add_input.setPlaceholderText("6位代码 或 点🔍搜名字"); self._add_input.setFont(QFont(FONT,9))
-        self._add_input.setFixedWidth(150); self._add_input.setStyleSheet("QLineEdit{padding:6px 8px;border:1px solid #ddd;border-radius:7px;}")
+        atitle = QLabel("快速添加"); atitle.setFont(QFont(FONT,9,QFont.Bold)); atitle.setStyleSheet(f"color:{t['text']};"); abl.addWidget(atitle)
+        self._add_title = atitle
+        self._add_input = QLineEdit(); self._add_input.setPlaceholderText("6位代码，或点「搜名字」"); self._add_input.setFont(QFont(FONT,9))
+        self._add_input.setFixedWidth(150); self._add_input.setStyleSheet(f"QLineEdit{{padding:6px 8px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}")
         abl.addWidget(self._add_input)
-        self._search_btn = QPushButton("🔍 搜名字"); self._search_btn.setFont(QFont(FONT,9))
-        self._search_btn.setStyleSheet("QPushButton{padding:6px 12px;border-radius:7px;background:#eef2ff;color:#4f46e5;border:none;}QPushButton:hover{background:#e0e7ff;}")
+        self._search_btn = QPushButton("搜名字"); self._search_btn.setFont(QFont(FONT,9))
+        self._search_btn.setStyleSheet(soft_btn_qss(t))
         self._search_btn.clicked.connect(self._search_pick); abl.addWidget(self._search_btn)
         self._add_btn = QPushButton("添加"); self._add_btn.setFont(QFont(FONT,9))
-        self._add_btn.setStyleSheet("QPushButton{padding:6px 14px;border-radius:7px;background:#2563eb;color:#fff;border:none;}QPushButton:hover{background:#1d4ed8;}QPushButton:disabled{background:#bbb;}")
+        self._add_btn.setStyleSheet(soft_btn_qss(t))
         self._add_btn.clicked.connect(self._add_fund); abl.addWidget(self._add_btn)
-        self._rm_btn = QPushButton("🗑 移除自加"); self._rm_btn.setFont(QFont(FONT,9))
-        self._rm_btn.setStyleSheet("QPushButton{padding:6px 12px;border-radius:7px;background:#fdecea;color:#b3261e;border:1px solid #f5b7b1;}QPushButton:hover{background:#f8d7da;}")
+        self._rm_btn = QPushButton("移除自加"); self._rm_btn.setFont(QFont(FONT,9))
+        self._rm_btn.setStyleSheet(f"QPushButton{{padding:6px 12px;border-radius:6px;background:transparent;color:{t['up']};border:1px solid {t['card_border']};}}QPushButton:hover{{background:{t['hover_bg']};}}")
         self._rm_btn.clicked.connect(self._remove_custom_fund); abl.addWidget(self._rm_btn)
         abl.addStretch()
         left_col.addWidget(add_box)
-        chart_box = QFrame(); chart_box.setStyleSheet("QFrame{background:#fff;border:1px solid #eee;border-radius:10px;}")
+        chart_box = QFrame(); chart_box.setStyleSheet(board_qss())
         cl = QVBoxLayout(chart_box); cl.setContentsMargins(8,8,8,4)
-        ctitle = QLabel("📈  今日涨跌一览（涨红跌绿）"); ctitle.setFont(QFont(FONT,10,QFont.Bold)); cl.addWidget(ctitle)
-        self.chart = BarChart(); self.chart.setFixedHeight(180); cl.addWidget(self.chart); left_col.addWidget(chart_box)
-        self.board = QFrame(); self.board.setStyleSheet("QFrame{background:#fff;border:1px solid #eee;border-radius:10px;}")
+        ctitle = QLabel("今日涨跌一览（涨红跌绿）"); ctitle.setFont(QFont(FONT,10,QFont.Bold)); ctitle.setStyleSheet(f"color:{t['text']};"); cl.addWidget(ctitle)
+        self.chart = BarChart(); self.chart.setFixedHeight(180); self.chart.apply_theme(); cl.addWidget(self.chart); left_col.addWidget(chart_box)
+        self._chart_box = chart_box
+        self.board = QFrame(); self.board.setStyleSheet(board_qss())
         bl = QHBoxLayout(self.board); bl.setContentsMargins(14,10,14,10)
-        self._red_col = QVBoxLayout(); rh = QLabel("🔥 今日红榜"); rh.setFont(QFont(FONT,10,QFont.Bold)); rh.setStyleSheet("color:#e53935;"); self._red_col.addWidget(rh)
+        self._red_col = QVBoxLayout(); rh = QLabel("今日红榜"); rh.setFont(QFont(FONT,10,QFont.Bold)); rh.setStyleSheet(f"color:{T()['up']};"); self._red_col.addWidget(rh)
         self._red_rows = [QLabel("—") for _ in range(3)]
-        for lb in self._red_rows: lb.setFont(QFont(FONT,9)); lb.setStyleSheet("color:#c0392b;"); self._red_col.addWidget(lb)
-        self._green_col = QVBoxLayout(); gh = QLabel("💧 今日黑榜"); gh.setFont(QFont(FONT,10,QFont.Bold)); gh.setStyleSheet("color:#16a34a;"); self._green_col.addWidget(gh)
+        for lb in self._red_rows: lb.setFont(QFont(FONT,9)); lb.setStyleSheet(f"color:{T()['up']};"); self._red_col.addWidget(lb)
+        self._green_col = QVBoxLayout(); gh = QLabel("今日黑榜"); gh.setFont(QFont(FONT,10,QFont.Bold)); gh.setStyleSheet(f"color:{T()['down']};"); self._green_col.addWidget(gh)
         self._green_rows = [QLabel("—") for _ in range(3)]
-        for lb in self._green_rows: lb.setFont(QFont(FONT,9)); lb.setStyleSheet("color:#15803d;"); self._green_col.addWidget(lb)
+        for lb in self._green_rows: lb.setFont(QFont(FONT,9)); lb.setStyleSheet(f"color:{T()['down']};"); self._green_col.addWidget(lb)
         bl.addLayout(self._red_col); bl.addSpacing(20); bl.addLayout(self._green_col); left_col.addWidget(self.board)
         # 快照全貌区已随 OCR 移除（lbl_snap_total / snap_box 不再创建）
         left_col.addStretch()
         left_scroll.setWidget(left_wrap); split.addWidget(left_scroll)
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setMinimumWidth(440)
         scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        scroll.viewport().setStyleSheet("background:transparent;")  # v2.0.0：视口透明，主题底色透出来（修“空白区不变色”）
         self.cards_wrap = QWidget(); self.cards_layout = QVBoxLayout(self.cards_wrap); self.cards_layout.setSpacing(8); self.cards_layout.addStretch()
         scroll.setWidget(self.cards_wrap)
         right_wrap = QWidget(); rw = QVBoxLayout(right_wrap); rw.setContentsMargins(0,0,0,0); rw.setSpacing(6)
         sort_row = QHBoxLayout()  # v1.5：卡片排序
-        _sort_lbl = QLabel("卡片排序"); _sort_lbl.setFont(QFont(FONT,9)); _sort_lbl.setStyleSheet("color:#999;")
+        _sort_lbl = QLabel("卡片排序"); _sort_lbl.setFont(QFont(FONT,9)); _sort_lbl.setStyleSheet(f"color:{t['muted']};")
+        self._sort_lbl = _sort_lbl
         self._sort_combo = QComboBox(); self._sort_combo.setFont(QFont(FONT,9))
-        for _t, _v in (("默认顺序","default"),("估值·低估优先","val_asc"),("估值·过热优先","val_desc"),("今日涨幅优先","chg_desc"),("持有金额优先","mv_desc")):
-            self._sort_combo.addItem(_t, _v)
-        self._sort_combo.setStyleSheet("QComboBox{padding:3px 8px;border:1px solid #ddd;border-radius:6px;background:#fff;}")
+        for _t2, _v in (("默认顺序","default"),("估值·低估优先","val_asc"),("估值·过热优先","val_desc"),("今日涨幅优先","chg_desc"),("持有金额优先","mv_desc")):
+            self._sort_combo.addItem(_t2, _v)
+        self._sort_combo.setStyleSheet(f"QComboBox{{padding:3px 8px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}")
         _sm = (load_settings() or {}).get("sort_mode", "default")
         _six = self._sort_combo.findData(_sm)
         if _six >= 0: self._sort_combo.setCurrentIndex(_six)
@@ -3144,6 +3447,8 @@ class MainWindow(QMainWindow):
         split.addWidget(right_wrap)
         split.setChildrenCollapsible(False); split.setStretchFactor(0, 4); split.setStretchFactor(1, 6)
         split.setSizes([520, 760])
+        self._split = split
+        self._theme_split()
         outer.addWidget(split, 1)
         self.cards = {}
         self._cleared_codes = getattr(self, "_cleared_codes", load_show_state())
@@ -3155,6 +3460,85 @@ class MainWindow(QMainWindow):
             self.cards_layout.insertWidget(self.cards_layout.count()-1,c); self.cards[code]=c
         self._sync_empty_banner()
         return w
+
+    def _theme_split(self):
+        """v2.0.0：分栏手柄随主题着色（构建与切换共用）。"""
+        if hasattr(self, "_split"):
+            self._split.setStyleSheet(f"QSplitter::handle{{background:{T()['card_border']};}}")
+
+    def _open_settings(self):
+        """v1.7：设置（主题切换）。"""
+        d = SettingsDialog(self)
+        if d.exec() == QDialog.Accepted:
+            choice = d.combo.currentData()
+            if choice and choice != _THEME:
+                set_theme(choice)
+                s = load_settings() or {}; s["theme"] = choice; save_settings(s)
+                self._restyle_all()
+
+    def _apply_global_qss(self):
+        """v2.0.0：弹窗/表格类控件全局主题样式（四主题全应用：classic 不再豁免，保全程序样式统一）。"""
+        self.setStyleSheet(global_qss(T()))
+
+    def _restyle_all(self):
+        """v1.7/v2.0.0：主题切换后全量重刷令牌化组件。"""
+        t = T()
+        self._apply_global_qss()
+        root = getattr(self, "_home_root", None)
+        if root is not None:
+            root.setStyleSheet(f"#homeRoot{{background:{t['win_bg']};}}" if t["win_bg"] else "")
+        # 顶栏（v2.0.0：图标/文字/徽章随主题重绘）
+        if hasattr(self, "_logo_lbl"):
+            self._logo_lbl.setPixmap(icon_pixmap("logo", t["accent"], 26))
+            self._title_lbl.setStyleSheet(f"color:{t['text']};")
+            self._ver_lbl.setStyleSheet(f"color:{t['muted']};border:1px solid {t['card_border']};border-radius:4px;padding:1px 5px;")
+            self.lbl_time.setStyleSheet(f"color:{t['muted']};"); self._acc_lbl.setStyleSheet(f"color:{t['muted']};")
+            self._account_combo.setStyleSheet(f"QComboBox{{padding:5px 10px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}")
+            for b, kind, _txt in self._tb_navs:
+                b.setIcon(QIcon(icon_pixmap(kind, t["muted"], 15))); b.setStyleSheet(ghost_btn_qss(t))
+            for b, kind in self._tb_tools:
+                b.setIcon(QIcon(icon_pixmap(kind, t["muted"], 15))); b.setStyleSheet(ghost_btn_qss(t, pad="0px"))
+            self.btn_refresh.setIcon(QIcon(icon_pixmap("refresh", "#ffffff", 15))); self.btn_refresh.setStyleSheet(primary_btn_qss(t))
+        # 提示条/快速添加/排序（v2.0.0）
+        if hasattr(self, "lbl_fix"):
+            self.lbl_fix.setStyleSheet(f"QLabel{{color:{t['mid_val']};background:{t['hover_bg']};border:1px solid {t['card_border']};border-radius:8px;padding:8px 12px;}}")
+            self.lbl_alert.setStyleSheet(f"QLabel{{color:{t['up']};background:{t['hover_bg']};border:1px solid {t['card_border']};border-radius:8px;padding:8px 12px;}}")
+            _info = f"QLabel{{color:{t['accent']};background:{t['accent_soft']};border:1px solid {t['accent_soft_hover']};border-radius:8px;padding:8px 12px;font-size:12px;}}"
+            self.lbl_noacc.setStyleSheet(_info); self.lbl_empty.setStyleSheet(_info.replace("8px;", "10px;").replace("padding:8px 12px", "padding:14px 16px"))
+            self._add_input.setStyleSheet(f"QLineEdit{{padding:6px 8px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}")
+            self._search_btn.setStyleSheet(soft_btn_qss(t)); self._add_btn.setStyleSheet(soft_btn_qss(t))
+            self._rm_btn.setStyleSheet(f"QPushButton{{padding:6px 12px;border-radius:6px;background:transparent;color:{t['up']};border:1px solid {t['card_border']};}}QPushButton:hover{{background:{t['hover_bg']};}}")
+            if hasattr(self, "_sort_combo"):
+                self._sort_combo.setStyleSheet(combo_qss(t))
+        if hasattr(self, "_account_combo"):  # v2.0.0 返工五：账户下拉也随主题重刷（Win11 风格）
+            self._account_combo.setStyleSheet(combo_qss(t))
+        if hasattr(self, "summary"): self.summary.setStyleSheet(panel_qss())
+        if hasattr(self, "_split"): self._theme_split()
+        if hasattr(self, "board"): self.board.setStyleSheet(board_qss())
+        if hasattr(self, "_chart_box"): self._chart_box.setStyleSheet(board_qss())
+        if hasattr(self, "chart"): self.chart.apply_theme()
+        if hasattr(self, "_add_box"):  # v2.0.0 返工②：快速添加区随主题重刷
+            self._add_box.setStyleSheet(board_qss())
+            self._add_title.setStyleSheet(f"color:{t['text']};")
+        if hasattr(self, "_sort_lbl"): self._sort_lbl.setStyleSheet(f"color:{t['muted']};")
+        if hasattr(self, "_red_col"):
+            for lb in [self._red_col.itemAt(i).widget() for i in range(self._red_col.count())]:
+                if lb: lb.setStyleSheet(f"color:{t['up']};")
+            for lb in [self._green_col.itemAt(i).widget() for i in range(self._green_col.count())]:
+                if lb: lb.setStyleSheet(f"color:{t['down']};")
+        for c in self.cards.values():
+            c.setStyleSheet(card_qss_cleared() if getattr(c, "_cleared", False) else card_qss_normal())
+            c.lbl_code.setStyleSheet(f"color:{t['muted']};")
+            c.lbl_nav.setStyleSheet(f"color:{t['text_sub']};")
+            c.lbl_mv.setStyleSheet(f"color:{t['text']};")
+            c._theme_btns()  # v2.0.0 返工②：卡片按钮随主题重刷
+        # v2.0.0 返工③：估值信号标签按缓存重刷（颜色/档位随主题）
+        _vc = self._val_cache.get("pct") or {}
+        for code, c in self.cards.items():
+            c.set_val(_vc.get(code))
+        if hasattr(self, "detail"): self.detail._apply_theme()
+        if self.last_results:
+            self._apply_results()
 
     def _toggle_cleared(self, code):
         card = self.cards.get(code)
@@ -3214,7 +3598,7 @@ class MainWindow(QMainWindow):
         if not FUNDS:
             self._sync_empty_banner()
             return
-        self.btn_refresh.setEnabled(False); self.btn_refresh.setText("⏳  抓取中…")
+        self.btn_refresh.setEnabled(False); self.btn_refresh.setText("抓取中…")
         self.lbl_time.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         self.worker = Worker(); self.worker.done.connect(self._on_home_done); self.worker.start()
 
@@ -3224,7 +3608,7 @@ class MainWindow(QMainWindow):
         for _cd, _c in self.cards.items(): _c.set_cleared(_cd in self._cleared_codes)
         self._apply_results(); self._fade_cards()
         self._start_val_worker(results)  # v1.3：估值红绿灯后台拉取
-        self.btn_refresh.setEnabled(True); self.btn_refresh.setText("🔄  刷新数据")
+        self.btn_refresh.setEnabled(True); self.btn_refresh.setText("刷新数据")
         if sum(1 for r in results if r.get("status")=="ok") == 0:
             QMessageBox.warning(self,"没抓到数据","全部抓取失败，请点「🩺 诊断」。")
 
@@ -3341,7 +3725,7 @@ class MainWindow(QMainWindow):
                     prin=float(r2.get("principal") or 0)  # v1.2：本金缺失时用 成本×份额 兑底
                     total_prin += prin if prin > 0 else cost*sh
         if has:
-            self.lbl_total.setText(f"总持仓市值  ¥{total_mv:,.2f}"); self.lbl_total.setStyleSheet("color:#222;")
+            self.lbl_total.setText(f"总持仓市值  ¥{total_mv:,.2f}"); self.lbl_total.setStyleSheet(f"color:{T()['text']};")
             pc=RED if today_pnl>=0 else GREEN
             _nds = [r.get("nav_date","") for r in results if r.get("status")=="ok" and r.get("nav_date")]
             _nd = max(_nds) if _nds else ""
@@ -3353,14 +3737,14 @@ class MainWindow(QMainWindow):
             self.lbl_cum.setText(f"累计收益  {cum:+,.2f}元 ({pct:+.2f}%)"); self.lbl_cum.setStyleSheet(f"color:{cpc};")
         else:
             # 无手填持仓 → 显示平均涨跌（OCR 快照回退已移除）
-            self.lbl_total.setText("总持仓市值  未填持仓"); self.lbl_total.setStyleSheet("color:#999;font-size:12px;")
-            self.lbl_cum.setText("累计收益  —"); self.lbl_cum.setStyleSheet("color:#999;")
+            self.lbl_total.setText("总持仓市值  未填持仓"); self.lbl_total.setStyleSheet(f"color:{T()['muted']};font-size:12px;")
+            self.lbl_cum.setText("累计收益  —"); self.lbl_cum.setStyleSheet(f"color:{T()['muted']};")
             chgs=[d.get("chg",0) for d in results if d.get("status")=="ok"]
             if chgs:
                 avg=sum(chgs)/len(chgs); pc=RED if avg>=0 else GREEN
                 self.lbl_today.setText(f"今日平均涨跌  {avg:+.2f}%（{len(chgs)}只）"); self.lbl_today.setStyleSheet(f"color:{pc};")
             else:
-                self.lbl_today.setText("今日盈亏  —"); self.lbl_today.setStyleSheet("color:#999;")
+                self.lbl_today.setText("今日盈亏  —"); self.lbl_today.setStyleSheet(f"color:{T()['muted']};")
 
     def _open_export(self):
         ExportDialog(self).exec()
