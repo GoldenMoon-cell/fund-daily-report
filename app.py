@@ -114,7 +114,7 @@ SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
 SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -638,6 +638,54 @@ def concentration_stats(resolved, price_map):
             "top3_pct": round(sum(v for _, v in mvs[:3]) / total * 100, 1)}
 
 
+# ---------- v2.1.0 卡片迷你走势（近 60 交易日净值 sparkline：轻量拉取 + 按日缓存） ----------
+SPARK_FILE = "走势缓存.json"   # v2.1.0 迷你走势缓存（按日失效；仅缓存层，不属持仓/交易账本）
+SPARK_DAYS = 60               # 走势点数 = 近 60 交易日（用户拍板 v2.1.0 方案）
+
+def load_spark_cache():
+    d = _load_json_with_bak(SPARK_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+def save_spark_cache(d):
+    try:
+        _atomic_write_json(SPARK_FILE, d)
+    except Exception:
+        pass
+
+def spark_from_lsjz(txt):
+    """v2.1.0 纯函数：lsjz 接口单页 JSON 文本 → 净值序列（新在前原样返回，合并/截断由调用方做）。
+       脏数据/空值丢弃；解析失败返回空列表。"""
+    try:
+        data = json.loads(txt)
+    except Exception:
+        return []
+    pts = []
+    for it in ((data.get("Data") or {}).get("LSJZList") or []):
+        try:
+            v = float(it.get("DWJZ"))
+            if v > 0: pts.append(v)
+        except Exception:
+            pass
+    return pts
+
+def _lsjz_page(code, page, size=SPARK_DAYS):
+    req = urllib.request.Request(
+        f"https://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex={page}&pageSize={size}",
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://fundf10.eastmoney.com/"})
+    with urllib.request.urlopen(req, timeout=10, context=_SSL) as r:
+        return spark_from_lsjz(r.read().decode("utf-8", "ignore"))
+
+def fetch_spark(code):
+    """v2.1.0：lsjz 分页接口轻量拉近 N 日净值（比 fetch_history 全历史小几十倍）。
+       实测 pageSize 被接口忽略、单页固定 20 条 → 拉三页合并再截断，返回旧在前。"""
+    code = (code or "").strip()
+    if len(code) != 6 or not code.isdigit():
+        raise RuntimeError("基金代码无效")
+    pts = _lsjz_page(code, 1) + _lsjz_page(code, 2) + _lsjz_page(code, 3)
+    pts.reverse()  # 三页均为新在前 → 合并后翻转为旧在前
+    return pts[-SPARK_DAYS:]
+
+
 # ---------- v1.4 估值口径升级（指数基金走跟踪指数 PE/PB 百分位，行业标准口径） ----------
 INDEX_VALUATION_URL = "https://danjuanfunds.com/djapi/index_eva/dj"  # 蛋卷指数估值（非官方接口，需兜底）
 PB_FIRST_KEYWORDS = ("红利", "银行", "地产", "证券", "金融", "价值", "周期", "煤炭", "钢铁", "基建")  # 行业惯例看 PB 的指数族
@@ -1142,6 +1190,25 @@ class ValWorker(QThread):
         self.done.emit(out)
 
 
+class SparkWorker(QThread):
+    """v2.1.0：卡片迷你走势后台拉取（近 60 日净值），不阻塞主线程；
+       单只失败静默丢弃（走势拉不到不影响卡片其余数据，线位留白）。"""
+    done = Signal(dict)
+    def __init__(self, codes):
+        super().__init__(); self.codes = list(codes)
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor
+        out = {}
+        def one(code):
+            try: return code, fetch_spark(code)
+            except Exception: return code, None
+        if self.codes:
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                for code, pts in ex.map(one, self.codes):
+                    if pts: out[code] = pts
+        self.done.emit(out)
+
+
 class DateAxis(pg.AxisItem):
     def __init__(self, *a, **k):
         super().__init__(*a, **k); self._hist = []; self._fmt = "%m-%d"
@@ -1163,11 +1230,14 @@ class BarChart(pg.PlotWidget):
         self._bars_x = []; self._bars_vals = []; self._bars_colors = []; self._bars_names = []
 
     def apply_theme(self):
-        """v2.0.0：柱状图按主题令牌着色（背景/轴线/刻度文字）。"""
+        """v2.0.0/v2.1.0：柱状图按主题令牌着色（背景/双轴刻度文字/柱顶数值标签）。"""
         t = T()
         self.setBackground(QColor(t["card_bg"]))
-        ax = self.getAxis("left")
-        ax.setTextPen(QColor(t["muted"])); ax.setPen(QColor(t["card_border"]))
+        for _an in ("left", "bottom"):  # v2.1.0 返工：底轴（基金名）也要刷，此前只刷左轴
+            ax = self.getAxis(_an)
+            ax.setTextPen(QColor(t["muted"])); ax.setPen(QColor(t["card_border"]))
+        for lb in getattr(self, "_val_labels", []):  # 已画出的柱顶数值标签同步重着
+            lb.setColor(QColor(t["text"]))
 
     def draw(self, items, animate=True):
         self.clear(); self._bar_item = None
@@ -1198,8 +1268,11 @@ class BarChart(pg.PlotWidget):
     def _finish(self):
         if self._bar_item:
             self._bar_item.setOpts(height=self._bars_vals)
+        self._val_labels = []
         for xi, v in zip(self._bars_x, self._bars_vals):
-            t = pg.TextItem(f"{v:+.2f}%", color=(0,0,0), anchor=(0.5, 1 if v >= 0 else 0)); t.setFont(QFont(FONT,8)); self.addItem(t); t.setPos(xi, v)
+            # v2.1.0 返工：柱顶数值标签改主题令牌（原硬编码纯黑，暗色主题下隐形）
+            t = pg.TextItem(f"{v:+.2f}%", color=QColor(T()["text"]), anchor=(0.5, 1 if v >= 0 else 0)); t.setFont(QFont(FONT,8)); self.addItem(t); t.setPos(xi, v)
+            self._val_labels.append(t)
 
 
 class ElideLabel(QLabel):
@@ -1216,34 +1289,80 @@ class ElideLabel(QLabel):
         super().setText(self.fontMetrics().elidedText(self._full, Qt.ElideRight, w))
 
 
+class Sparkline(QWidget):
+    """v2.1.0：卡片迷你走势线——近 60 交易日净值 QPainter 直画（FD-HIG 图形资产铁律）。
+       区间涨=信号红、跌=信号绿（与涨跌幅语义一致）；灰章置 faint；
+       颜色在 paintEvent 实时读 T()，主题切换后 update() 即自动跟随。"""
+    def __init__(self):
+        super().__init__()
+        self._pts = []; self._dim = False
+        self.setFixedHeight(28); self.setMinimumWidth(96); self.setMaximumWidth(150)
+        self.setToolTip("近 60 交易日净值走势")
+    def set_points(self, pts):
+        self._pts = [float(p) for p in (pts or []) if p and float(p) > 0]; self.update()
+    def set_dim(self, on):
+        self._dim = bool(on); self.update()
+    def paintEvent(self, ev):
+        pts = self._pts
+        if len(pts) < 2: return  # 无数据留白（降级不画）
+        t = T()
+        col = QColor(t["faint"] if self._dim else (t["up"] if pts[-1] >= pts[0] else t["down"]))
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing, True)
+        w, h = self.width(), self.height(); pad = 2.0
+        lo, hi = min(pts), max(pts); rng = (hi - lo) or 1.0; n = len(pts)
+        path = QPainterPath()
+        for i, v in enumerate(pts):
+            x = pad + (w - 2*pad) * i / (n - 1)
+            y = pad + (h - 2*pad) * (1 - (v - lo) / rng)
+            if i: path.lineTo(x, y)
+            else: path.moveTo(x, y)
+        pen = QPen(col, 1.6); pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen); p.drawPath(path)
+        # 尾点小圆点：最新净值位置
+        x = pad + (w - 2*pad); y = pad + (h - 2*pad) * (1 - (pts[-1] - lo) / rng)
+        p.setPen(Qt.NoPen); p.setBrush(col); p.drawEllipse(QPointF(x, y), 2.2, 2.2)
+
+
 class FundCard(QFrame):
     def __init__(self, code):
         super().__init__(); self.code = code; self.setFrameShape(QFrame.StyledPanel)
         self.setStyleSheet(card_qss_normal())  # v1.7 令牌化
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        lay = QHBoxLayout(self); lay.setContentsMargins(14,12,14,12)
-        left = QVBoxLayout(); left.setSpacing(2)
+        # v2.1.0 逐屏精细化·卡片：三行结构（名称行｜估值+走势行｜持仓摘要+按钮行），涨跌幅升主角
+        lay = QVBoxLayout(self); lay.setContentsMargins(14,10,14,10); lay.setSpacing(5)
+        r1 = QHBoxLayout(); r1.setSpacing(8)  # 行一：名称+代码·净值 ｜ 大字涨跌幅
         self.lbl_name = ElideLabel("—"); self.lbl_name.setFont(QFont(FONT,11,QFont.Bold))
+        self.lbl_name.setStyleSheet(f"color:{T()['text']};")  # v2.1.0 返工：名称无默认主题色，暗底隐形
         self.lbl_name.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); self.lbl_name.setMinimumWidth(0)
         self.lbl_code = QLabel(code); self.lbl_code.setFont(QFont(FONT,8)); self.lbl_code.setStyleSheet(f"color:{T()['muted']};")
+        self.lbl_nav = QLabel("净值 —"); self.lbl_nav.setFont(QFont(FONT,8)); self.lbl_nav.setStyleSheet(f"color:{T()['muted']};")
+        r1.addWidget(self.lbl_name); r1.addWidget(self.lbl_code); r1.addWidget(self.lbl_nav); r1.addStretch()
+        self.lbl_chg = QLabel("—"); self.lbl_chg.setFont(QFont(FONT,22,QFont.Bold))  # v2.1.0：16→22 大字排版
+        self.lbl_chg.setAlignment(Qt.AlignRight|Qt.AlignVCenter)
+        r1.addWidget(self.lbl_chg); lay.addLayout(r1)
+        r2 = QHBoxLayout(); r2.setSpacing(8)  # 行二：估值信号 ｜ 迷你走势
         self.lbl_val = QLabel(""); self.lbl_val.setFont(QFont(FONT,8))  # v1.3 估值红绿灯
         self.lbl_val.setToolTip("估值参考（v1.4）：指数基金看跟踪指数 PE/PB 百分位（红利/金融族看 PB）；主动基金显示近 1 年净值分位；债基/货币/商品无估值口径不显示信号。≥80% 过热，≤20% 低估。仅信息展示，不构成投资建议。")
-        left.addWidget(self.lbl_name); left.addWidget(self.lbl_code); left.addWidget(self.lbl_val); lay.addLayout(left,3)
-        mid = QVBoxLayout(); mid.setSpacing(2)
-        self.lbl_nav = QLabel("净值 —"); self.lbl_nav.setFont(QFont(FONT,9)); self.lbl_nav.setStyleSheet(f"color:{T()['text_sub']};")
-        self.lbl_nav.setMinimumWidth(0)
-        self.lbl_mv = QLabel(""); self.lbl_mv.setFont(QFont(FONT,9,QFont.Bold)); self.lbl_mv.setStyleSheet(f"color:{T()['text']};"); self.lbl_mv.setMinimumWidth(0)
-        self.lbl_today = QLabel("今日 —"); self.lbl_today.setFont(QFont(FONT,9,QFont.Bold)); self.lbl_today.setMinimumWidth(0)
-        self.lbl_pnl = QLabel("累计 —"); self.lbl_pnl.setFont(QFont(FONT,8)); self.lbl_pnl.setMinimumWidth(0)
-        mid.addWidget(self.lbl_nav); mid.addWidget(self.lbl_mv); mid.addWidget(self.lbl_today); mid.addWidget(self.lbl_pnl); lay.addLayout(mid,2)
-        self.lbl_chg = QLabel("—"); self.lbl_chg.setFont(QFont(FONT,16,QFont.Bold)); self.lbl_chg.setAlignment(Qt.AlignCenter); lay.addWidget(self.lbl_chg,2)
-        right = QVBoxLayout(); right.setSpacing(6)
+        r2.addWidget(self.lbl_val); r2.addStretch()
+        self.spark = Sparkline(); r2.addWidget(self.spark); lay.addLayout(r2)
+        r3 = QHBoxLayout(); r3.setSpacing(6)  # 行三：持有·今日·累计一行合并 ｜ 按钮
+        self.lbl_mv = QLabel(""); self.lbl_mv.setFont(QFont(FONT,9,QFont.Bold)); self.lbl_mv.setStyleSheet(f"color:{T()['text']};")
+        self._sep1 = QLabel("·"); self._sep1.setStyleSheet(f"color:{T()['faint']};"); self._sep1.setVisible(False)
+        self.lbl_today = QLabel(""); self.lbl_today.setFont(QFont(FONT,9))
+        self._sep2 = QLabel("·"); self._sep2.setStyleSheet(f"color:{T()['faint']};"); self._sep2.setVisible(False)
+        self.lbl_pnl = QLabel(""); self.lbl_pnl.setFont(QFont(FONT,9))
+        for _w in (self.lbl_mv, self._sep1, self.lbl_today, self._sep2, self.lbl_pnl): r3.addWidget(_w)
+        r3.addStretch()
         self.btn_clear = QPushButton("标记清仓"); self.btn_clear.setFont(QFont(FONT,8))
         self.btn_clear.setCheckable(True)
-        right.addWidget(self.btn_clear)
         self.btn_detail = QPushButton("详情 →"); self.btn_detail.setFont(QFont(FONT,9))
         self._theme_btns()
-        right.addWidget(self.btn_detail,1); lay.addLayout(right,1)
+        r3.addWidget(self.btn_clear); r3.addWidget(self.btn_detail); lay.addLayout(r3)
+
+    def _sync_seps(self):
+        """v2.1.0：持仓行『·』分隔符随相邻标签有无显隐。"""
+        self._sep1.setVisible(bool(self.lbl_mv.text()) and bool(self.lbl_today.text()))
+        self._sep2.setVisible(bool(self.lbl_today.text()) and bool(self.lbl_pnl.text()))
 
     def _theme_btns(self):
         """v2.0.0：卡片按钮按当前主题重刷（构建与主题切换共用）。"""
@@ -1257,16 +1376,19 @@ class FundCard(QFrame):
         self.btn_clear.setChecked(self._cleared)
         self.btn_clear.setText("🚫 已清仓" if self._cleared else "标记清仓")
         self.btn_clear.setToolTip("已清仓: 不参与柱状图/红黑榜/总持仓统计, 卡片仅观察。点『恢复持有』还原。" if self._cleared else "卖出后盖灰章: 该只不再计入总账与榜单, 卡片置灰仅观察; 持仓记录不受影响, 可随时恢复。")
+        self.spark.set_dim(self._cleared)  # v2.1.0：走势线随灰章置淡
         if self._cleared:
             self.setStyleSheet(card_qss_cleared())
-            self.lbl_chg.setText("已清仓"); self.lbl_chg.setStyleSheet(f"color:{T()['muted']};font-size:12px;")
+            self.lbl_chg.setText("已清仓"); self.lbl_chg.setStyleSheet(f"color:{T()['muted']};font-size:13px;")
             self.lbl_val.setText("")  # v1.3：灰章不显示估值信号
             self.lbl_mv.setText("仅观察·不计入总账"); self.lbl_mv.setStyleSheet(f"color:{T()['faint']};")
             self.lbl_today.setText("—"); self.lbl_today.setStyleSheet(f"color:{T()['faint']};")
             self.lbl_pnl.setText("持仓记录保留"); self.lbl_pnl.setStyleSheet(f"color:{T()['faint']};")
+            self._sync_seps()
             self.btn_detail.setEnabled(False); self.btn_detail.setStyleSheet(f"QPushButton{{padding:8px 12px;border-radius:8px;background:{T()['btn_disabled_bg']};color:{T()['faint']};border:none;}}")
         else:
             self.setStyleSheet(card_qss_normal())
+            self.lbl_chg.setStyleSheet(f"color:{GRAY};font-size:22px;")
             self.btn_detail.setEnabled(True); self.btn_detail.setStyleSheet(f"QPushButton{{padding:8px 12px;border-radius:8px;background:{T()['accent_soft']};color:{T()['accent']};border:none;}}QPushButton:hover{{background:{T()['accent_soft_hover']};}}")
 
     def set_val_loading(self):
@@ -1298,8 +1420,9 @@ class FundCard(QFrame):
             self.lbl_chg.setText("—"); self.lbl_chg.setStyleSheet(f"color:{GRAY};")
             self.lbl_mv.setText(""); self.lbl_mv.setStyleSheet(f"color:{T()['text']};")
             self.lbl_today.setText("今日 —"); self.lbl_today.setStyleSheet(f"color:{T()['faint']};")
-            self.lbl_pnl.setText(f"⚠ {d.get('err','')[:18]}"); self.lbl_pnl.setStyleSheet("color:#e53935;font-size:8px;"); return
-        self.lbl_nav.setText(f"净值 {nav:.4f}"); self.lbl_nav.setStyleSheet(f"color:{T()['text_sub']};")
+            self.lbl_pnl.setText(f"⚠ {d.get('err','')[:18]}"); self.lbl_pnl.setStyleSheet("color:#e53935;font-size:8px;")
+            self._sync_seps(); return
+        self.lbl_nav.setText(f"净值 {nav:.4f}"); self.lbl_nav.setStyleSheet(f"color:{T()['muted']};")
         chg = d.get("chg",0); color = RED if chg>0 else (GREEN if chg<0 else GRAY)
         self.lbl_chg.setText(f"{chg:+.2f}%"); self.lbl_chg.setStyleSheet(f"color:{color};")
         nd = (d.get("nav_date") or "").strip()
@@ -1332,6 +1455,7 @@ class FundCard(QFrame):
             self.lbl_mv.setText(""); self.lbl_mv.setStyleSheet(f"color:{T()['text']};")
             self.lbl_today.setText(f"{day_tag} —"); self.lbl_today.setStyleSheet(f"color:{T()['faint']};")
             self.lbl_pnl.setText("盈亏 未填持仓"); self.lbl_pnl.setStyleSheet(f"color:{T()['faint']};")
+        self._sync_seps()
 
 RANGE_DAYS = {"近1月": 30, "近3月": 90, "近6月": 180, "近1年": 365, "全部": None}
 
@@ -3299,6 +3423,8 @@ class MainWindow(QMainWindow):
         self._cleared_codes = load_show_state()
         self._pnl_dialog = None
         self._val_cache = {}   # v1.3 估值红绿灯缓存 {"date": 当日, "pct": {code: 百分位}}
+        self._spark_cache = load_spark_cache()  # v2.1.0 迷你走势缓存 {"date": 当日, "data": {code: [净值…]}}
+        self._spark_workers = []  # v2.1.0：持有工作线程引用防 GC
         self._refresh_home()
         self._check_update()
 
@@ -3335,12 +3461,12 @@ class MainWindow(QMainWindow):
         self.lbl_time = QLabel(""); self.lbl_time.setStyleSheet(f"color:{t['muted']};"); top.addWidget(self.lbl_time)
         top.addSpacing(8)
         self._acc_lbl = QLabel("账户"); self._acc_lbl.setStyleSheet(f"color:{t['muted']};"); top.addWidget(self._acc_lbl)
-        self._account_combo = QComboBox()
+        self._account_combo = QComboBox(); self._account_combo.setFont(QFont(FONT,9))
+        self._account_combo.setStyleSheet(combo_qss(t))  # v2.1.0 返工：构建时即上 Win11 风样式（此前只在 _restyle_all 里，首开时原生 Win98 样）
         self._account_combo.addItem("全部账户", "__all__")
         for _a in load_accounts():
             self._account_combo.addItem(_a, _a)
         self._account_combo.currentIndexChanged.connect(self._on_account_changed)
-        self._account_combo.setStyleSheet(f"QComboBox{{padding:5px 10px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}")
         top.addWidget(self._account_combo)
         top.addSpacing(6)
         # 导航群：统一幽灵按钮（去彩虹/去 emoji，手绘图标+文字）
@@ -3411,6 +3537,7 @@ class MainWindow(QMainWindow):
         chart_box = QFrame(); chart_box.setStyleSheet(board_qss())
         cl = QVBoxLayout(chart_box); cl.setContentsMargins(8,8,8,4)
         ctitle = QLabel("今日涨跌一览（涨红跌绿）"); ctitle.setFont(QFont(FONT,10,QFont.Bold)); ctitle.setStyleSheet(f"color:{t['text']};"); cl.addWidget(ctitle)
+        self._chart_title = ctitle  # v2.1.0 返工：存引用供 _restyle_all 重刷（防切主题后停在旧色）
         self.chart = BarChart(); self.chart.setFixedHeight(180); self.chart.apply_theme(); cl.addWidget(self.chart); left_col.addWidget(chart_box)
         self._chart_box = chart_box
         self.board = QFrame(); self.board.setStyleSheet(board_qss())
@@ -3437,7 +3564,7 @@ class MainWindow(QMainWindow):
         self._sort_combo = QComboBox(); self._sort_combo.setFont(QFont(FONT,9))
         for _t2, _v in (("默认顺序","default"),("估值·低估优先","val_asc"),("估值·过热优先","val_desc"),("今日涨幅优先","chg_desc"),("持有金额优先","mv_desc")):
             self._sort_combo.addItem(_t2, _v)
-        self._sort_combo.setStyleSheet(f"QComboBox{{padding:3px 8px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}")
+        self._sort_combo.setStyleSheet(combo_qss(t))  # v2.1.0 返工：原 1.x 内联样式无子控件箭头，改 Win11 风 combo_qss
         _sm = (load_settings() or {}).get("sort_mode", "default")
         _six = self._sort_combo.findData(_sm)
         if _six >= 0: self._sort_combo.setCurrentIndex(_six)
@@ -3457,6 +3584,8 @@ class MainWindow(QMainWindow):
             c.btn_detail.clicked.connect(lambda checked, cd=code: self._open_detail(cd))
             c.btn_clear.clicked.connect(lambda checked, cd=code: self._toggle_cleared(cd))
             if code in self._cleared_codes: c.set_cleared(True)
+            _sp = (getattr(self, "_spark_cache", {}) or {}).get("data", {})
+            if _sp.get(code): c.spark.set_points(_sp[code])  # v2.1.0：构建时命中缓存先画上
             self.cards_layout.insertWidget(self.cards_layout.count()-1,c); self.cards[code]=c
         self._sync_empty_banner()
         return w
@@ -3493,7 +3622,7 @@ class MainWindow(QMainWindow):
             self._title_lbl.setStyleSheet(f"color:{t['text']};")
             self._ver_lbl.setStyleSheet(f"color:{t['muted']};border:1px solid {t['card_border']};border-radius:4px;padding:1px 5px;")
             self.lbl_time.setStyleSheet(f"color:{t['muted']};"); self._acc_lbl.setStyleSheet(f"color:{t['muted']};")
-            self._account_combo.setStyleSheet(f"QComboBox{{padding:5px 10px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}")
+            self._account_combo.setStyleSheet(combo_qss(t))  # v2.1.0 返工：Win11 风（含箭头子控件），原 1.x 内联样式无子控件致首开 Win98 样
             for b, kind, _txt in self._tb_navs:
                 b.setIcon(QIcon(icon_pixmap(kind, t["muted"], 15))); b.setStyleSheet(ghost_btn_qss(t))
             for b, kind in self._tb_tools:
@@ -3510,12 +3639,11 @@ class MainWindow(QMainWindow):
             self._rm_btn.setStyleSheet(f"QPushButton{{padding:6px 12px;border-radius:6px;background:transparent;color:{t['up']};border:1px solid {t['card_border']};}}QPushButton:hover{{background:{t['hover_bg']};}}")
             if hasattr(self, "_sort_combo"):
                 self._sort_combo.setStyleSheet(combo_qss(t))
-        if hasattr(self, "_account_combo"):  # v2.0.0 返工五：账户下拉也随主题重刷（Win11 风格）
-            self._account_combo.setStyleSheet(combo_qss(t))
         if hasattr(self, "summary"): self.summary.setStyleSheet(panel_qss())
         if hasattr(self, "_split"): self._theme_split()
         if hasattr(self, "board"): self.board.setStyleSheet(board_qss())
         if hasattr(self, "_chart_box"): self._chart_box.setStyleSheet(board_qss())
+        if hasattr(self, "_chart_title"): self._chart_title.setStyleSheet(f"color:{t['text']};")  # v2.1.0 返工：图表标题随主题重刷
         if hasattr(self, "chart"): self.chart.apply_theme()
         if hasattr(self, "_add_box"):  # v2.0.0 返工②：快速添加区随主题重刷
             self._add_box.setStyleSheet(board_qss())
@@ -3528,9 +3656,12 @@ class MainWindow(QMainWindow):
                 if lb: lb.setStyleSheet(f"color:{t['down']};")
         for c in self.cards.values():
             c.setStyleSheet(card_qss_cleared() if getattr(c, "_cleared", False) else card_qss_normal())
+            c.lbl_name.setStyleSheet(f"color:{t['text']};")  # v2.1.0 返工：基金名随主题重刷
             c.lbl_code.setStyleSheet(f"color:{t['muted']};")
-            c.lbl_nav.setStyleSheet(f"color:{t['text_sub']};")
+            c.lbl_nav.setStyleSheet(f"color:{t['muted']};")
             c.lbl_mv.setStyleSheet(f"color:{t['text']};")
+            c._sep1.setStyleSheet(f"color:{t['faint']};"); c._sep2.setStyleSheet(f"color:{t['faint']};")
+            c.spark.update()  # v2.1.0：走势线颜色实时读令牌，重绘即随主题
             c._theme_btns()  # v2.0.0 返工②：卡片按钮随主题重刷
         # v2.0.0 返工③：估值信号标签按缓存重刷（颜色/档位随主题）
         _vc = self._val_cache.get("pct") or {}
@@ -3608,6 +3739,7 @@ class MainWindow(QMainWindow):
         for _cd, _c in self.cards.items(): _c.set_cleared(_cd in self._cleared_codes)
         self._apply_results(); self._fade_cards()
         self._start_val_worker(results)  # v1.3：估值红绿灯后台拉取
+        self._start_spark_worker(results)  # v2.1.0：卡片迷你走势后台拉取
         self.btn_refresh.setEnabled(True); self.btn_refresh.setText("刷新数据")
         if sum(1 for r in results if r.get("status")=="ok") == 0:
             QMessageBox.warning(self,"没抓到数据","全部抓取失败，请点「🩺 诊断」。")
@@ -3641,6 +3773,29 @@ class MainWindow(QMainWindow):
             card = self.cards.get(c)
             if card: card.set_val(info)
         self._apply_sort()  # v1.5：估值到达后按分位排序才有数据
+
+    def _start_spark_worker(self, results):
+        """v2.1.0：卡片迷你走势——当日缓存命中直接画，其余后台拉近 60 日净值。"""
+        codes = [d["code"] for d in results if d.get("status") == "ok"]
+        if not codes: return
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._spark_cache.get("date") != today:
+            self._spark_cache = {"date": today, "data": {}}
+        data = self._spark_cache["data"]
+        for c in codes:
+            card = self.cards.get(c)
+            if card and data.get(c): card.spark.set_points(data[c])
+        todo = [c for c in codes if not data.get(c)]
+        if not todo: return
+        w = SparkWorker(todo); w.done.connect(self._on_spark_done)
+        self._spark_workers.append(w); w.start()
+
+    def _on_spark_done(self, pts_map):
+        self._spark_cache.setdefault("data", {}).update(pts_map)
+        save_spark_cache(self._spark_cache)  # 落盘按日缓存，当日再刷不重复请求
+        for c, pts in pts_map.items():
+            card = self.cards.get(c)
+            if card: card.spark.set_points(pts)
 
     def _apply_results(self):
         price_map = {d["code"]: d.get("nav",0) for d in self.last_results if d.get("status")=="ok"}
@@ -3933,6 +4088,8 @@ class MainWindow(QMainWindow):
         self.cards[code] = card
         card.update_data(r, self.resolved)
         self.last_results.append(r)
+        w = SparkWorker([code]); w.done.connect(self._on_spark_done)  # v2.1.0：新加基金也拉走势
+        self._spark_workers.append(w); w.start()
         self._redraw_aggregates(); self._add_input.clear()
         self._sync_empty_banner()
         QMessageBox.information(self,"已添加",
