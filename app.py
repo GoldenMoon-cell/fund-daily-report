@@ -2,18 +2,14 @@
 """基金日报助手 - 桌面版
 本地化的基金持仓看板与日报工具：实时估值/历史净值/回撤修复/同类排名/指数对比，
 持仓本地存储，支持粘贴导入、交易记账、已清仓标记。
-（OCR 截图导入功能已移除，以加快迭代；如需可后续单独接回。）"""
+"""
 import sys
 import json
 import urllib.request
-import urllib.parse
 import re
-import ssl
 import traceback
 import numpy as np
 import os
-import shutil
-import tempfile
 import zipfile
 from datetime import datetime, timedelta
 
@@ -28,10 +24,15 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, QTimer, QPropertyAnimation, QAbstractAnimation, QDate,
-    QPointF, QRectF,
+    QPointF,
 )
-from PySide6.QtGui import QFont, QColor, QCursor, QPainter, QPen, QPixmap, QPainterPath, QIcon
+from PySide6.QtGui import QFont, QColor, QCursor, QPainter, QPen, QPainterPath, QIcon
 import pyqtgraph as pg
+
+import data_sources as market_data
+import domain as domain_logic
+import storage as storage_layer
+import ui_theme as theme_ui
 
 # 工作目录固定为程序所在目录，保证相对路径在源码/脚本/打包环境下行为一致
 if getattr(sys, 'frozen', False):
@@ -51,41 +52,12 @@ FUNDS = []   # 看板基金全部来自「自定义基金.json」；初始为空
 EXTRA_FILE = "自定义基金.json"
 
 def _atomic_write_json(path, obj, **kw):
-    """统一写盘防烂：先备 .bak，再写同目录临时文件并 os.replace 原子替换，
-       中断/崩溃不会留下半截 json（v0.5 推广到全部数据文件）。"""
-    try:
-        if os.path.exists(path):
-            shutil.copy2(path, path + ".bak")
-    except Exception:
-        pass
-    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
-                               dir=os.path.dirname(os.path.abspath(path)) or ".")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, **kw)
-        os.replace(tmp, path)
-    except Exception:
-        try: os.remove(tmp)
-        except Exception: pass
-        raise
+    """v2.3 兼容出口：实际原子写盘实现位于 storage.py。"""
+    return storage_layer.atomic_write_json(path, obj, **kw)
 
 def _load_json_with_bak(path, default):
-    """读 json；主文件损坏时回退 .bak 并把 .bak 恢复为主文件；都不行返回 default。"""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return default
-    except Exception:
-        pass
-    try:
-        with open(path + ".bak", "r", encoding="utf-8") as f:
-            data = json.load(f)
-        try: shutil.copy2(path + ".bak", path)
-        except Exception: pass
-        return data
-    except Exception:
-        return default
+    """v2.3 兼容出口：实际损坏回退实现位于 storage.py。"""
+    return storage_layer.load_json_with_bak(path, default)
 
 def _load_extra():
     arr = _load_json_with_bak(EXTRA_FILE, [])
@@ -114,48 +86,15 @@ SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
 SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
 HL = QColor("#fff7d6")
 
-# ---------- v1.7 主题地基：语义令牌字典（FD-HIG 落地基础，2.0.0 全面焕新的骨架） ----------
-# 令牌语义见《设计规范.md》；classic=1.x 原样（视觉零变化），其余三套为 FD-HIG 定案色板。
-THEMES = {
-    "classic": {"name": "经典", "dark": False, "win_bg": "",
-        "card_bg": "#ffffff", "card_border": "#eeeeee", "card_hover": "#bbccdd", "hover_bg": "#f3f4f6",
-        "cleared_bg": "#f6f6f6", "cleared_border": "#bbbbbb",
-        "panel_bg": "#f7f9fc", "panel_border": "#eef0f3",
-        "text": "#222222", "text_sub": "#666666", "muted": "#999999", "faint": "#bbbbbb",
-        "up": "#e53935", "down": "#16a34a", "flat": "#888888", "mid_val": "#b45309",
-        "accent": "#2563eb", "accent_hover": "#1d4ed8",
-        "accent_soft": "#eef3ff", "accent_soft_hover": "#dbe6ff", "btn_disabled_bg": "#eeeeee"},
-    "b_dark": {"name": "深空暗", "dark": True, "win_bg": "#10151c",
-        "card_bg": "#161d27", "card_border": "#313d4d", "card_hover": "#334052", "hover_bg": "#1b2430",
-        "cleared_bg": "#141a22", "cleared_border": "#3a4656",
-        "panel_bg": "#161d27", "panel_border": "#313d4d",
-        "text": "#e8edf3", "text_sub": "#c9d2dc", "muted": "#97a4b4", "faint": "#707e8e",
-        "up": "#ff5d5d", "down": "#34c77b", "flat": "#8b96a3", "mid_val": "#d97706",
-        "accent": "#3d7eff", "accent_hover": "#2f6ae0",
-        "accent_soft": "#1b2a4a", "accent_soft_hover": "#223559", "btn_disabled_bg": "#1a212b"},
-    "b_light": {"name": "晨雾浅色", "dark": False, "win_bg": "#f5f7fa",
-        "card_bg": "#ffffff", "card_border": "#e4e9f0", "card_hover": "#c9d4e4", "hover_bg": "#edf0f4",
-        "cleared_bg": "#f2f4f7", "cleared_border": "#d3dae3",
-        "panel_bg": "#ffffff", "panel_border": "#e4e9f0",
-        "text": "#1a2230", "text_sub": "#4a5568", "muted": "#6b7889", "faint": "#9aa5b3",
-        "up": "#e5484d", "down": "#18a058", "flat": "#888888", "mid_val": "#b45309",
-        "accent": "#2563eb", "accent_hover": "#1d4ed8",
-        "accent_soft": "#e8efff", "accent_soft_hover": "#d5e2ff", "btn_disabled_bg": "#eef0f3"},
-    "paper": {"name": "纸账本", "dark": False, "win_bg": "#f7f1e6",
-        "card_bg": "#fffbf2", "card_border": "#e2d5b8", "card_hover": "#cdbb92", "hover_bg": "#f1e8d6",
-        "cleared_bg": "#f3ecdd", "cleared_border": "#d8c9a8",
-        "panel_bg": "#fffbf2", "panel_border": "#e2d5b8",
-        "text": "#2b2620", "text_sub": "#5c5346", "muted": "#8a7f6d", "faint": "#b0a691",
-        "up": "#c23d2e", "down": "#2f7d5c", "flat": "#8a7f6d", "mid_val": "#b45309",
-        "accent": "#c23d2e", "accent_hover": "#a83325",
-        "accent_soft": "#f7e8dd", "accent_soft_hover": "#f0dbc9", "btn_disabled_bg": "#efe7d8"},
-}
+# ---------- v2.3 主题模块兼容层 ----------
+# 令牌与 QSS/QPainter 资产的唯一实现位于 ui_theme.py；app.py 保留旧调用名。
+THEMES = theme_ui.THEMES
 _THEME = "classic"
 def T():
     """当前主题令牌表（v1.7）。"""
@@ -166,176 +105,58 @@ def set_theme(name):
     if name in THEMES: _THEME = name
     t = T(); RED, GREEN, GRAY = t["up"], t["down"], t["flat"]
 def card_qss_normal():
-    t = T(); return f"FundCard{{background:{t['card_bg']};border:1px solid {t['card_border']};border-radius:10px;}}FundCard:hover{{border:1px solid {t['card_hover']};}}"
+    return theme_ui.card_qss_normal(T())
 def card_qss_cleared():
-    t = T(); return f"FundCard{{background:{t['cleared_bg']};border:1px dashed {t['cleared_border']};border-radius:10px;}}"
+    return theme_ui.card_qss_cleared(T())
 def panel_qss():
-    t = T(); return f"QFrame{{background:{t['panel_bg']};border-radius:10px;}}"
+    return theme_ui.panel_qss(T())
 def board_qss():
-    t = T(); return f"QFrame{{background:{t['card_bg']};border:1px solid {t['card_border']};border-radius:10px;}}"
+    return theme_ui.board_qss(T())
 def ghost_btn_qss(t=None, pad="7px 12px"):
     """v2.0.0：幽灵按钮（FD-HIG 按钮家族 Ghost：透明底+发丝边，导航/工具用）。"""
-    t = t or T()
-    return (f"QPushButton{{padding:{pad};border:1px solid {t['card_border']};border-radius:6px;"
-            f"background:transparent;color:{t['text_sub']};}}"
-            f"QPushButton:hover{{background:{t['hover_bg']};color:{t['text']};}}")
+    return theme_ui.ghost_btn_qss(t or T(), pad)
 def primary_btn_qss(t=None):
     """v2.0.0：主操作按钮（FD-HIG Primary：每屏最多一个）。"""
-    t = t or T()
-    return (f"QPushButton{{padding:8px 14px;border-radius:6px;background:{t['accent']};color:#ffffff;border:none;}}"
-            f"QPushButton:hover{{background:{t['accent_hover']};}}"
-            f"QPushButton:disabled{{background:{t['btn_disabled_bg']};color:{t['flat']};}}")
+    return theme_ui.primary_btn_qss(t or T())
 def soft_btn_qss(t=None):
     """v2.0.0：软按钮（FD-HIG Soft：卡片内轻操作）。"""
-    t = t or T()
-    return (f"QPushButton{{padding:6px 12px;border-radius:6px;background:{t['accent_soft']};color:{t['accent']};border:none;}}"
-            f"QPushButton:hover{{background:{t['accent_soft_hover']};}}")
+    return theme_ui.soft_btn_qss(t or T())
 def danger_btn_qss(t=None, pad="8px 14px"):
     """v2.0.0：危险按钮（FD-HIG Danger：破坏性操作，红描边红字）。"""
-    t = t or T()
-    return (f"QPushButton{{padding:{pad};border-radius:6px;background:transparent;color:{t['up']};border:1px solid {t['card_border']};}}"
-            f"QPushButton:hover{{background:{t['hover_bg']};border-color:{t['up']};}}")
+    return theme_ui.danger_btn_qss(t or T(), pad)
 def panel_label_qss(kind="tip"):
     """v2.0.0：提示条标签（tip 中性 / warn 警示 / ok 成功），全主题适配。"""
-    t = T()
-    if kind == "warn":
-        return f"QLabel{{color:{t['mid_val']};background:{t['hover_bg']};border:1px solid {t['card_border']};border-radius:8px;padding:6px 10px;}}"
-    if kind == "ok":
-        return f"QLabel{{color:{t['down']};background:{t['hover_bg']};border:1px solid {t['card_border']};border-radius:8px;padding:6px 10px;}}"
-    return f"QLabel{{color:{t['text_sub']};background:{t['panel_bg']};border:1px solid {t['panel_border']};border-radius:8px;padding:8px;}}"
+    return theme_ui.panel_label_qss(T(), kind)
 def table_qss(extra=""):
     """v2.0.0：表格主题样式（背景/斑马纹/表头/选中态）。"""
-    t = T()
-    return (f"QTableWidget{{background:{t['card_bg']};alternate-background-color:{t['panel_bg']};color:{t['text']};"
-            f"gridline-color:{t['card_border']};border:1px solid {t['card_border']};{extra}}}"
-            f"QTableWidget::item:selected{{background:{t['accent_soft']};color:{t['text']};}}"
-            f"QHeaderView::section{{background:{t['panel_bg']};color:{t['text_sub']};border:none;padding:5px;font-weight:bold;}}")
-_ARROW_FILES = {}
+    return theme_ui.table_qss(T(), extra)
 def _arrow_png(kind, color):
     """v2.0.0：下拉/日期控件箭头用 QPainter 直画存 PNG，QSS 按绝对路径引用。
        （CSS 边框三角在 Qt 里实测渲染成横条，弃用。）"""
-    key = (kind, color)
-    path = _ARROW_FILES.get(key)
-    if path and os.path.exists(path):
-        return path
-    pm = QPixmap(20, 12); pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing, True)
-    pen = QPen(QColor(color)); pen.setWidthF(2.2); pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
-    p.setPen(pen)
-    if kind == "down":
-        p.drawPolyline([QPointF(3,3), QPointF(10,9.5), QPointF(17,3)])
-    else:
-        p.drawPolyline([QPointF(3,9.5), QPointF(10,3), QPointF(17,9.5)])
-    p.end()
-    import tempfile
-    path = os.path.join(tempfile.gettempdir(), f"fund_arrow_{kind}_{color[1:]}.png").replace("\\", "/")
-    pm.save(path, "PNG")
-    _ARROW_FILES[key] = path
-    return path
+    return theme_ui.arrow_png(kind, color)
 
 def combo_qss(t=None):
     """v2.0.0：下拉框 Win11 风格（圆角/扁平/手绘箭头，去原生斜边框）。"""
-    t = t or T()
-    arrow = _arrow_png("down", t["muted"])
-    return (f"QComboBox{{padding:6px 12px;border:1px solid {t['card_border']};border-radius:6px;"
-            f"background:{t['card_bg']};color:{t['text']};}}"
-            f"QComboBox:hover{{border-color:{t['muted']};}}"
-            f"QComboBox:focus{{border-color:{t['accent']};}}"
-            f"QComboBox::drop-down{{border:none;width:26px;}}"
-            f"QComboBox::down-arrow{{image:url({arrow});width:12px;height:8px;margin-right:8px;}}")
+    return theme_ui.combo_qss(t or T())
 def input_qss(t=None):
-    t = t or T()
-    return f"QLineEdit{{padding:6px 8px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}"
+    return theme_ui.input_qss(t or T())
 def hl_bg():
     """主题感知的“本金误填”行高亮色（暗色主题用暗琥珀，避免刺眼亮黄）。"""
-    return QColor("#3d3216") if T().get("dark") else QColor("#fff7d6")
+    return theme_ui.highlight_background(T())
 def imp_bg():
     """主题感知的“导入/对账待核对”单元格高亮色。"""
-    return QColor("#4a3419") if T().get("dark") else QColor("#ffe0b2")
+    return theme_ui.import_background(T())
 def blend_color(bg_hex, fg_hex, alpha):
     """v2.0.0：把 fg 按 alpha 混入 bg（收益日历格子配色用，全主题通用）。"""
-    b = QColor(bg_hex); f = QColor(fg_hex)
-    return QColor(int(b.red()*(1-alpha)+f.red()*alpha), int(b.green()*(1-alpha)+f.green()*alpha), int(b.blue()*(1-alpha)+f.blue()*alpha)).name()
+    return theme_ui.blend_color(bg_hex, fg_hex, alpha)
 def global_qss(t):
-    """v2.0.0：弹窗/表格/输入类控件的全局主题样式（classic 不应用，保原生外观）。"""
-    win_bg = t["win_bg"] or "#ffffff"
-    return (f"QDialog,QMessageBox{{background:{t['card_bg']};}}"
-            f"QDialog QLabel,QMessageBox QLabel{{color:{t['text']};background:transparent;}}"
-            f"QDialog QPushButton,QMessageBox QPushButton{{padding:6px 14px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}"
-            f"QDialog QPushButton:hover,QMessageBox QPushButton:hover{{background:{t['hover_bg']};}}"
-            f"QDialog QComboBox,QMessageBox QComboBox{{padding:6px 12px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}"
-                        f"QDialog QComboBox::drop-down,QMessageBox QComboBox::drop-down{{border:none;width:26px;}}"
-                        f"QDialog QComboBox::down-arrow,QMessageBox QComboBox::down-arrow{{image:url({_arrow_png('down', t['muted'])});width:12px;height:8px;margin-right:8px;}}"
-            f"QDialog QDateEdit::up-button,QDialog QDateEdit::down-button{{border:none;width:16px;background:transparent;}}"
-            f"QDialog QDateEdit::up-arrow{{image:url({_arrow_png('up', t['muted'])});width:10px;height:7px;}}"
-            f"QDialog QDateEdit::down-arrow{{image:url({_arrow_png('down', t['muted'])});width:10px;height:7px;}}"
-            f"QComboBox QAbstractItemView{{background:{t['card_bg']};color:{t['text']};border:1px solid {t['card_border']};selection-background-color:{t['accent_soft']};selection-color:{t['accent']};}}"
-            f"QDialog QTextEdit,QDialog QLineEdit,QDialog QDateEdit{{background:{win_bg};color:{t['text']};border:1px solid {t['card_border']};border-radius:6px;padding:4px;}}"
-            f"QDialog QCheckBox,QDialog QRadioButton{{color:{t['text']};}}"
-            f"QDialog QTableWidget{{background:{t['card_bg']};alternate-background-color:{t['panel_bg']};color:{t['text']};gridline-color:{t['card_border']};border:1px solid {t['card_border']};}}"
-            f"QDialog QHeaderView::section{{background:{t['panel_bg']};color:{t['text_sub']};border:none;padding:4px;}}"
-            f"QCalendarWidget{{background:{t['card_bg']};color:{t['text']};}}"
-            f"QCalendarWidget QToolButton{{color:{t['text']};}}"
-            f"QScrollArea{{border:none;background:transparent;}}"
-            f"QToolTip{{background:{t['card_bg']};color:{t['text']};border:1px solid {t['card_border']};}}"
-            f"QScrollBar:vertical{{background:transparent;width:10px;}}"
-            f"QScrollBar::handle:vertical{{background:{t['card_border']};border-radius:5px;min-height:24px;}}")
+    """v2.0.0：弹窗/表格/输入类控件的全局主题样式（四主题均应用）。"""
+    return theme_ui.global_qss(t)
 
 def icon_pixmap(kind, color, size=24, stroke=1.6):
     """v2.0.0：原创手绘图标（QPainter 直画，无 emoji 无图标库）。
        FD-HIG 图标规范：24 网格 / 1.5~1.6 线宽 / 圆帽圆角连接 / 单色。"""
-    pm = QPixmap(size, size); pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing, True)
-    pen = QPen(QColor(color)); pen.setWidthF(stroke); pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
-    p.setPen(pen); p.setBrush(Qt.NoBrush)
-    k = size / 24.0
-    def pt(x, y): return QPointF(x * k, y * k)
-    def pl(*pts):
-        pp = QPainterPath(pt(*pts[0]))
-        for q in pts[1:]: pp.lineTo(pt(*q))
-        return pp
-    if kind == "logo":  # 标识：圆角方框内上升折线+定位点
-        p.drawRoundedRect(QRectF(2.5*k, 2.5*k, 19*k, 19*k), 5*k, 5*k)
-        p.drawPath(pl((6.8,15.6),(10.2,11.5),(13.1,14.0),(17.0,8.8)))
-        p.setPen(Qt.NoPen); p.setBrush(QColor(color))
-        p.drawEllipse(pt(17.4, 8.2), 1.4*k, 1.4*k)
-    elif kind == "refresh":
-        pp = QPainterPath(); pp.arcTo(QRectF(4.5*k, 4.5*k, 15*k, 15*k), 65, 255)
-        p.drawPath(pp)
-        e = pp.currentPosition()
-        p.drawLine(e, QPointF(e.x() + 3.0*k, e.y() - 1.2*k))
-        p.drawLine(e, QPointF(e.x() + 0.8*k, e.y() - 3.2*k))
-    elif kind == "export":
-        p.drawLine(pt(12,4), pt(12,13))
-        p.drawPath(pl((8.6,9.8),(12,13.2),(15.4,9.8)))
-        p.drawPath(pl((5,16.5),(5,19),(19,19),(19,16.5)))
-    elif kind == "backup":
-        p.drawRoundedRect(QRectF(4*k, 4.5*k, 16*k, 4.5*k), 1.2*k, 1.2*k)
-        p.drawPath(pl((6,9),(6,17.8),(18,17.8),(18,9)))
-        p.drawLine(pt(10,12.9), pt(14,12.9))
-    elif kind == "about":
-        p.drawEllipse(pt(12,12), 8.5*k, 8.5*k)
-        p.drawLine(pt(12,11.2), pt(12,16.4))
-        p.drawLine(pt(12,7.7), pt(12,8.2))
-    elif kind == "hold":
-        p.drawRoundedRect(QRectF(3.5*k, 7.5*k, 17*k, 12*k), 2*k, 2*k)
-        p.drawPath(pl((9,7.5),(9,5.6),(15,5.6),(15,7.5)))
-        p.drawLine(pt(3.5,12.6), pt(20.5,12.6))
-    elif kind == "pnl":
-        p.drawLine(pt(4.5,19), pt(19.5,19))
-        p.drawLine(pt(8,19), pt(8,12.5)); p.drawLine(pt(12,19), pt(12,7.5)); p.drawLine(pt(16,19), pt(16,14.5))
-    elif kind == "trades":
-        p.drawRoundedRect(QRectF(5*k, 3.5*k, 14*k, 17*k), 2*k, 2*k)
-        p.drawLine(pt(8,8.2), pt(16,8.2)); p.drawLine(pt(8,12), pt(16,12)); p.drawLine(pt(8,15.8), pt(12.5,15.8))
-    elif kind == "diag":
-        p.drawPath(pl((3,12.5),(7,12.5),(9.4,7),(12.6,17),(15,12.5),(21,12.5)))
-    elif kind == "settings":
-        p.drawLine(pt(4,8), pt(20,8)); p.drawEllipse(pt(9.5,8), 2*k, 2*k)
-        p.drawLine(pt(4,16), pt(20,16)); p.drawEllipse(pt(14.5,16), 2*k, 2*k)
-    p.end()
-    return pm
+    return theme_ui.icon_pixmap(kind, color, size, stroke)
 IMP = QColor("#ffe0b2")
 REPAIR_THRESHOLD = 0.5
 CMP_INDEX = [("1.000300", "沪深300"), ("1.000905", "中证500"), ("1.000016", "上证50"), ("0.399006", "创业板指")]
@@ -353,18 +174,7 @@ TRACK = {
     "022098": ("股票指数型", "跟踪 中证红利低波动100指数（高股息+低波动双因子）"),
 }
 
-_SSL = ssl.create_default_context(); _SSL.check_hostname = False; _SSL.verify_mode = ssl.CERT_NONE
-_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": "https://fund.eastmoney.com/"}
-_HEADERS_IDX = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Referer": "https://quote.eastmoney.com/",
-    "Accept": "*/*",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-    "Connection": "keep-alive",
-    "Sec-Fetch-Dest": "script",
-    "Sec-Fetch-Mode": "no-cors",
-    "Sec-Fetch-Site": "same-site",
-}
+_SSL = market_data.DEFAULT_SSL_CONTEXT
 
 
 def load_accounts():
@@ -416,25 +226,7 @@ def load_holdings_for_account(account):
 
 def merge_holdings(nested):
     """合并所有账户持仓 → {code: {shares, cost, principal, buy_date}}。"""
-    out = {}
-    for acc_name, holdings in nested.items():
-        if not isinstance(holdings, dict): continue
-        for code, rec in holdings.items():
-            if not isinstance(rec, dict): continue
-            sh = float(rec.get("shares") or 0)
-            prin = float(rec.get("principal") or 0)
-            bd = (rec.get("buy_date") or "").strip()
-            if code not in out:
-                out[code] = {"shares": sh, "principal": prin, "buy_date": bd}
-            else:
-                out[code]["shares"] += sh
-                out[code]["principal"] += prin
-                if bd and (not out[code]["buy_date"] or bd < out[code]["buy_date"]):
-                    out[code]["buy_date"] = bd
-    for code, rec in out.items():
-        sh, prin = rec["shares"], rec["principal"]
-        rec["cost"] = round(prin / sh, 4) if sh > 0 else 0.0
-    return out
+    return domain_logic.merge_holdings(nested)
 
 def save_holdings_nested(nested):
     """保存嵌套格式 {account: {code: rec}}。"""
@@ -470,13 +262,7 @@ def save_show_state(cleared):
 
 def _round_rec(rec):
     """落库前抹浮点尾巴：shares4位/cost4位/principal2位；其余键(如buy_date)原样。"""
-    if not isinstance(rec, dict):
-        return rec
-    out = dict(rec)
-    if "shares"    in out: out["shares"]    = round(float(out["shares"]), 4)
-    if "cost"      in out: out["cost"]      = round(float(out["cost"]), 4)
-    if "principal" in out: out["principal"] = round(float(out["principal"]), 2)
-    return out
+    return domain_logic.round_holding_record(rec)
 
 
 def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
@@ -561,86 +347,34 @@ def apply_trade(holdings, code, action, *, nav=None, amount=None, shares=None,
 
 
 def _http(url):
-    req = urllib.request.Request(url, headers=_HEADERS)
-    with urllib.request.urlopen(req, timeout=12, context=_SSL) as r:
-        return r.read().decode("utf-8", errors="ignore")
+    return market_data.http_text(url, ssl_context=_SSL)
 
 
 def resolve_holdings(holdings, price_map):
-    info = {}
-    for code, rec in holdings.items():
-        nav = price_map.get(code, 0)
-        try:
-            sh = float(rec.get("shares") or 0); raw = float(rec.get("cost") or 0)
-        except Exception:
-            sh = 0.0; raw = 0.0
-        c_per = raw; c_pri = raw / sh if sh > 0 else 0.0
-        def near(c, _nav=nav):
-            return _nav > 0 and c > 0 and 0.5 * _nav <= c <= 2.0 * _nav
-        info[code] = dict(sh=sh, raw=raw, per_near=near(c_per), pri_near=near(c_pri))
-    n = max(1, len(info))
-    score_per = sum(1 for v in info.values() if v["per_near"])
-    score_pri = sum(1 for v in info.values() if v["pri_near"])
-    global_principal = (score_pri > score_per and score_pri >= 0.6 * n)
-    resolved = {}; corrected = set()
-    for code, rec in holdings.items():
-        v = info[code]; sh = v["sh"]; raw = v["raw"]
-        corr = False; cost = raw; prin = rec.get("principal")
-        if global_principal and raw > 0 and sh > 0:
-            if v["per_near"] and not v["pri_near"]:
-                cost = raw
-            else:
-                cost = raw / sh; prin = raw; corr = True
-        resolved[code] = {"shares": sh, "cost": cost, "principal": prin, "corrected": corr}
-        if corr:
-            corrected.add(code)
-    return resolved, corrected
+    return domain_logic.resolve_holdings(holdings, price_map)
 
 
 # ---------- v1.3 参考信号（纯函数，无副作用，selfcheck 可测；仅信息展示不构成建议） ----------
 def nav_percentile(nav_list, nav):
     """当前净值在历史净值序列中的百分位（0~100）；数据不足 60 个或净值无效返回 None。"""
-    vals = [v for v in nav_list if v and v > 0]
-    if nav is None or nav <= 0 or len(vals) < 60:
-        return None
-    below = sum(1 for v in vals if v < nav)
-    return round(below / len(vals) * 100, 1)
+    return domain_logic.nav_percentile(nav_list, nav)
 
 def val_level(pct):
     """估值分档：>=80 过热 / <=20 低估 / 其余中性；None 原样返回。"""
-    if pct is None: return None
-    if pct >= 80: return "hot"
-    if pct <= 20: return "cold"
-    return "mid"
+    return domain_logic.val_level(pct)
 
 def take_profit_level(pct):
     """累计收益率触及的止盈参考线：>=20 → 20；>=15 → 15；否则 None。"""
-    if pct is None: return None
-    if pct >= 20: return 20
-    if pct >= 15: return 15
-    return None
+    return domain_logic.take_profit_level(pct)
 
 def concentration_stats(resolved, price_map):
     """持仓集中度：按当前市值算总市值/最大单只占比/前三大占比。无有效持仓返回 None。"""
-    mvs = []
-    for code, r in (resolved or {}).items():
-        sh = float((r or {}).get("shares") or 0)
-        nav = (price_map or {}).get(code, 0)
-        if sh > 0 and nav and nav > 0:
-            mvs.append((code, sh * float(nav)))
-    total = sum(v for _, v in mvs)
-    if total <= 0:
-        return None
-    mvs.sort(key=lambda x: -x[1])
-    return {"total": total, "n": len(mvs),
-            "top1_pct": round(mvs[0][1] / total * 100, 1),
-            "top1_name": NAME_MAP.get(mvs[0][0], mvs[0][0]),
-            "top3_pct": round(sum(v for _, v in mvs[:3]) / total * 100, 1)}
+    return domain_logic.concentration_stats(resolved, price_map, NAME_MAP)
 
 
 # ---------- v2.1.0 卡片迷你走势（近 60 交易日净值 sparkline：轻量拉取 + 按日缓存） ----------
 SPARK_FILE = "走势缓存.json"   # v2.1.0 迷你走势缓存（按日失效；仅缓存层，不属持仓/交易账本）
-SPARK_DAYS = 60               # 走势点数 = 近 60 交易日（用户拍板 v2.1.0 方案）
+SPARK_DAYS = market_data.SPARK_DAYS
 
 def load_spark_cache():
     d = _load_json_with_bak(SPARK_FILE, {})
@@ -655,282 +389,73 @@ def save_spark_cache(d):
 def spark_from_lsjz(txt):
     """v2.1.0 纯函数：lsjz 接口单页 JSON 文本 → 净值序列（新在前原样返回，合并/截断由调用方做）。
        脏数据/空值丢弃；解析失败返回空列表。"""
-    try:
-        data = json.loads(txt)
-    except Exception:
-        return []
-    pts = []
-    for it in ((data.get("Data") or {}).get("LSJZList") or []):
-        try:
-            v = float(it.get("DWJZ"))
-            if v > 0: pts.append(v)
-        except Exception:
-            pass
-    return pts
+    return market_data.spark_from_lsjz(txt)
 
 def _lsjz_page(code, page, size=SPARK_DAYS):
-    req = urllib.request.Request(
-        f"https://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex={page}&pageSize={size}",
-        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://fundf10.eastmoney.com/"})
-    with urllib.request.urlopen(req, timeout=10, context=_SSL) as r:
-        return spark_from_lsjz(r.read().decode("utf-8", "ignore"))
+    return market_data._lsjz_page(code, page, size, _SSL)
 
 def fetch_spark(code):
     """v2.1.0：lsjz 分页接口轻量拉近 N 日净值（比 fetch_history 全历史小几十倍）。
        实测 pageSize 被接口忽略、单页固定 20 条 → 拉三页合并再截断，返回旧在前。"""
-    code = (code or "").strip()
-    if len(code) != 6 or not code.isdigit():
-        raise RuntimeError("基金代码无效")
-    pts = _lsjz_page(code, 1) + _lsjz_page(code, 2) + _lsjz_page(code, 3)
-    pts.reverse()  # 三页均为新在前 → 合并后翻转为旧在前
-    return pts[-SPARK_DAYS:]
+    return market_data.fetch_spark(code, days=SPARK_DAYS, ssl_context=_SSL)
 
 
 # ---------- v1.4 估值口径升级（指数基金走跟踪指数 PE/PB 百分位，行业标准口径） ----------
-INDEX_VALUATION_URL = "https://danjuanfunds.com/djapi/index_eva/dj"  # 蛋卷指数估值（非官方接口，需兜底）
-PB_FIRST_KEYWORDS = ("红利", "银行", "地产", "证券", "金融", "价值", "周期", "煤炭", "钢铁", "基建")  # 行业惯例看 PB 的指数族
-INDEX_ALIASES = [("纳斯达克100", "纳指100"), ("纳斯达克", "纳指100"), ("恒生ETF", "恒生指数")]  # 基金名写法 → 蛋卷指数名（长别名在前；用“恒生ETF”而非“恒生”，避免误伤恒生医疗等未覆盖行业指数）
-NO_VAL_KEYWORDS = {"货币": "货币", "债": "债基",
-                   "黄金": "商品", "上海金": "商品", "原油": "商品", "石油": "商品",
-                   "豆粕": "商品", "能源化工": "商品", "REIT": "商品"}  # 无估值口径的基金族
-DUAL_METRIC_INDICES = ("恒生指数",)  # 跨行业宽基需 PE+PB 结合：科技成分看 PE、金融地产成分看 PB，单一指标失真
+INDEX_VALUATION_URL = market_data.INDEX_VALUATION_URL
+PB_FIRST_KEYWORDS = domain_logic.PB_FIRST_KEYWORDS
+INDEX_ALIASES = domain_logic.INDEX_ALIASES
+NO_VAL_KEYWORDS = domain_logic.NO_VAL_KEYWORDS
+DUAL_METRIC_INDICES = domain_logic.DUAL_METRIC_INDICES
 
 def fund_valuation_class(fund_name):
     """v1.4：判无估值口径的基金族（债基/货币/商品）→ 标签；普通基金返回 None。
        债基净值靠票息稳步向上、黄金原油无盈利概念，百分位信号只会误导。"""
-    if not fund_name: return None
-    for kw in ("货币", "债"):  # 先判债/货币，避免误落商品
-        if kw in fund_name: return NO_VAL_KEYWORDS[kw]
-    for kw, cls in NO_VAL_KEYWORDS.items():
-        if kw in fund_name: return cls
-    return None
+    return domain_logic.fund_valuation_class(fund_name)
 
 def fetch_index_valuation(timeout=8):
     """v1.4：拉取蛋卷指数估值（非官方接口，可能随时变动/限流）→ {指数名: {pe, pe_pct, pb, pb_pct}}。"""
-    req = urllib.request.Request(INDEX_VALUATION_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:
-        d = json.loads(r.read().decode("utf-8", errors="ignore"))
-    out = {}
-    for it in (d.get("data") or {}).get("items") or []:
-        name = (it.get("name") or "").strip()
-        if name:
-            out[name] = {"pe": it.get("pe") or 0, "pe_pct": round((it.get("pe_percentile") or 0) * 100, 1),
-                         "pb": it.get("pb") or 0, "pb_pct": round((it.get("pb_percentile") or 0) * 100, 1),
-                         "yield_pct": round((it.get("yeild") or 0) * 100, 2)}  # v1.5：股息率（上游字段名 yeild 是 typo，照原样读）
-    return out
+    return market_data.fetch_index_valuation(timeout=timeout, ssl_context=_SSL)
 
 def match_index(fund_name, val_map):
     """v1.4：在基金名里匹配跟踪指数名（最长优先，别名兜底）；未命中返回 None。"""
-    if not fund_name: return None
-    best = None
-    for idx in val_map:
-        if idx in fund_name and (best is None or len(idx) > len(best)):
-            best = idx
-    if best: return best
-    for alias, idx in INDEX_ALIASES:  # “纳斯达克100”→“纳指100”之类写法差异
-        if alias in fund_name and idx in val_map:
-            return idx
-    return None
+    return domain_logic.match_index(fund_name, val_map)
 
 def pick_index_pct(idx_name, val):
     """v1.4：红利/金融/周期族指数先看 PB 百分位，其余先看 PE 百分位；指标无效自动换另一指标。
        跨行业宽基（DUAL_METRIC_INDICES）PE+PB 结合：返回两项均值定档，metric 为 "PE78/PB53" 双值标签。
        返回 (百分位, 指标名)，指标都无效返回 (None, None)。"""
-    if idx_name in DUAL_METRIC_INDICES and (val.get("pe") or 0) > 0 and (val.get("pb") or 0) > 0:
-        return round((val["pe_pct"] + val["pb_pct"]) / 2, 1), f"PE{val['pe_pct']:.0f}/PB{val['pb_pct']:.0f}"
-    order = (("pb", "pb_pct"), ("pe", "pe_pct")) if any(k in idx_name for k in PB_FIRST_KEYWORDS) \
-            else (("pe", "pe_pct"), ("pb", "pb_pct"))
-    for vk, pk in order:
-        if (val.get(vk) or 0) > 0 and val.get(pk) is not None:
-            return val[pk], vk.upper()
-    return None, None
+    return domain_logic.pick_index_pct(idx_name, val)
 
 
 # ---------- v1.5 估值深化（信号文本/详情文本/卡片排序，纯函数可测） ----------
 def val_signal_text(info):
     """v1.5：卡片估值信号行文本。指数源带股息率；无效返回 None。"""
-    if not info or info.get("pct") is None: return None
-    lv = val_level(info["pct"])
-    lv_txt = {"hot": "🔴 过热", "cold": "🟢 低估"}.get(lv, "🟡 中性")
-    m = info.get("metric") or ""
-    base = f"{lv_txt} · {m}" if "/" in m else f"{lv_txt} · {m} {info['pct']:.0f}%分位"
-    y = info.get("yield_pct")
-    if info.get("src") == "index" and y:
-        base += f" · 息{y:.1f}%"
-    return base
+    return domain_logic.val_signal_text(info)
 
 def val_detail_text(info):
     """v1.5：估值完整一行文本（详情页/tooltip 用）。无信息返回 ""。"""
-    if not info: return ""
-    if info.get("src") == "na":
-        return f"{info.get('metric','')}·无估值口径"
-    pct = info.get("pct")
-    if pct is None: return ""
-    lv_txt = {"hot": "过热", "cold": "低估"}.get(val_level(pct), "中性")
-    if info.get("src") == "nav":
-        return f"估值参考：近 1 年净值分位 {pct:.0f}%（{lv_txt}）·主动基金无 PE/PB 口径"
-    parts = []
-    if info.get("pe"): parts.append(f"PE {info['pe']:.2f}（{info.get('pe_pct',0):.1f}%分位）")
-    if info.get("pb"): parts.append(f"PB {info['pb']:.2f}（{info.get('pb_pct',0):.1f}%分位）")
-    if info.get("yield_pct"): parts.append(f"股息率 {info['yield_pct']:.2f}%")
-    return f"估值参考（{info.get('idx','跟踪指数')}，{lv_txt}）：" + "｜".join(parts)
+    return domain_logic.val_detail_text(info)
 
 def sort_card_codes(codes, mode, val_map=None, chg_map=None, mv_map=None):
     """v1.5：卡片排序。default/val_asc(低估优先)/val_desc/chg_desc/mv_desc；无数据排最后。"""
-    codes = list(codes)
-    vm = val_map or {}
-    if mode == "val_asc":
-        return sorted(codes, key=lambda c: (vm.get(c) is None, vm.get(c) if vm.get(c) is not None else 0))
-    if mode == "val_desc":
-        return sorted(codes, key=lambda c: (vm.get(c) is None, -(vm.get(c) or 0)))
-    if mode == "chg_desc":
-        return sorted(codes, key=lambda c: -(chg_map or {}).get(c, -999))
-    if mode == "mv_desc":
-        return sorted(codes, key=lambda c: -(mv_map or {}).get(c, -1))
-    return codes
+    return domain_logic.sort_card_codes(codes, mode, val_map, chg_map, mv_map)
 
 
 def fetch_one(code):
-    last_err = ""
-    try:
-        txt = _http(f"https://fundgz.1234567.com.cn/js/{code}.js?rt={int(datetime.now().timestamp())}")
-        m = re.search(r"jsonpgz\((\{.*?\})\)", txt)
-        if m:
-            d = json.loads(m.group(1)); nav = float(d.get("dwjz", 0)); chg = float(d.get("gszzl", 0) or 0)
-            jzrq = (d.get("jzrq") or "").strip()
-            if nav > 0:
-                return {"code": code, "name": d.get("name", ""), "nav": nav,
-                        "est": float(d.get("gsz", 0) or 0), "chg": chg, "nav_date": jzrq,
-                        "status": "ok", "via": "估值接口"}
-        last_err = "通道1无jsonpgz"
-    except Exception as e:
-        last_err = f"通道1异常:{e}"
-    try:
-        txt = _http(f"https://fund.eastmoney.com/pingzhongdata/{code}.js")
-        m = re.search(r"Data_netWorthTrend\s*=\s*(\[.*?\]);", txt)
-        name_m = re.search(r"fS_name\s*=\s*\"(.*?)\"", txt)
-        if m:
-            arr = json.loads(m.group(1))
-            if arr:
-                nav = float(arr[-1].get("y", 0)); chg = 0.0
-                if len(arr) >= 2 and arr[-2].get("y"):
-                    chg = round((nav - float(arr[-2]["y"])) / float(arr[-2]["y"]) * 100, 2)
-                if nav > 0:
-                    try: _nd = datetime.fromtimestamp(int(arr[-1].get("x", 0))/1000).strftime("%Y-%m-%d")
-                    except Exception: _nd = ""
-                    return {"code": code, "name": name_m.group(1) if name_m else "",
-                            "nav": nav, "est": nav, "chg": chg, "nav_date": _nd,
-                            "status": "ok", "via": "详情接口(兜底)"}
-        last_err += " | 通道2无净值"
-    except Exception as e:
-        last_err += f" | 通道2异常:{e}"
-    return {"code": code, "name": "", "nav": 0, "est": 0, "chg": 0, "status": "fail", "err": last_err.strip(" |")}
+    return market_data.fetch_one(code, ssl_context=_SSL)
 
 
 def search_funds(key):
     """按名字/代码模糊搜基金（东财 suggest），返回 [(code, name)]；网络/解析失败返回 []。"""
-    key = (key or "").strip()
-    if not key: return []
-    try:
-        u = "https://fundsuggest.eastmoney.com/FundSearch/api/FundSearchAPI.ashx?m=1&key=" + urllib.parse.quote(key)
-        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://fund.eastmoney.com/"})
-        with urllib.request.urlopen(req, timeout=8, context=_SSL) as r:
-            j = json.loads(r.read().decode("utf-8", "ignore"))
-        out = []
-        for d in (j.get("Datas") or []):
-            c = str(d.get("CODE") or "").strip(); n = str(d.get("NAME") or "").strip()
-            if re.search(r"^\d{6}$", c) and n and (c, n) not in out:
-                out.append((c, n))
-        return out
-    except Exception:
-        return []
+    return market_data.search_funds(key, ssl_context=_SSL)
 
 
 def fetch_history(code):
-    txt = _http(f"https://fund.eastmoney.com/pingzhongdata/{code}.js")
-    name_m = re.search(r"fS_name\s*=\s*\"(.*?)\"", txt)
-    m = re.search(r"Data_netWorthTrend\s*=\s*(\[.*?\]);", txt)
-    if not m:
-        raise RuntimeError("解析历史净值失败")
-    arr = json.loads(m.group(1)); hist = []; prev = None
-    for it in arr:
-        ts = int(it.get("x", 0)); nav = float(it.get("y", 0)); eqt = it.get("eqt")
-        try:
-            eqt = float(eqt) if eqt not in (None, "") else None
-        except Exception:
-            eqt = None
-        if eqt is None and prev is not None and prev > 0:
-            eqt = round((nav - prev) / prev * 100, 4)
-        prev = nav; hist.append((ts, nav, eqt if eqt is not None else 0.0))
-
-    # —— 同类排名解析 ——
-    rank_by_ts = {}
-    _m_rank = re.search(r"Data_rateInSimilarType\s*=\s*\[", txt)
-    mr = None
-    if _m_rank:
-        _s = _m_rank.end() - 1
-        _depth = 0; _in_str = False; _esc = False; _end = -1
-        for _j in range(_s, min(_s + 2000000, len(txt))):
-            _ch = txt[_j]
-            if _esc: _esc = False; continue
-            if _ch == '\\': _esc = True; continue
-            if _ch == '"': _in_str = not _in_str; continue
-            if _in_str: continue
-            if _ch == '[': _depth += 1
-            elif _ch == ']':
-                _depth -= 1
-                if _depth == 0: _end = _j; break
-        if _end > _s:
-            class _R:
-                def __init__(self, body): self._b = body
-                def group(self, n): return self._b
-            mr = _R(txt[_s:_end+1])
-    if mr:
-        try:
-            for pair in json.loads(mr.group(1)):
-                if isinstance(pair, dict):
-                    rts = pair.get("x"); rkv = pair.get("y")
-                elif isinstance(pair, (list, tuple)) and len(pair) >= 2:
-                    rts = pair[0]; rkv = pair[1]
-                else:
-                    continue
-                try:
-                    if rts not in (None, "") and rkv not in (None, ""):
-                        rank_by_ts[int(rts)] = int(rkv)
-                except Exception:
-                    continue
-        except Exception:
-            rank_by_ts = {}
-    return (name_m.group(1) if name_m else ""), hist, rank_by_ts
+    return market_data.fetch_history(code, ssl_context=_SSL)
 
 
 def fetch_index_kline(secid):
-    market = "sh" if secid.startswith("1.") else "sz"
-    code6 = secid.split(".", 1)[1]
-    url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
-           f"param={market}{code6},day,,,800,qfq")
-    req = urllib.request.Request(url, headers=_HEADERS_IDX)
-    with urllib.request.urlopen(req, timeout=8, context=_SSL) as r:
-        txt = r.read().decode("utf-8", errors="ignore")
-    a = txt.find("{"); b = txt.rfind("}")
-    if a < 0 or b <= a:
-        raise RuntimeError(f"腾讯无json体 头={txt[:80]!r}")
-    d = json.loads(txt[a:b+1])
-    node = ((d.get("data") or {}).get(f"{market}{code6}")) or ((d.get("data") or {}).get(code6)) or {}
-    arr = node.get("day") or node.get("qfqday") or []
-    if not arr:
-        raise RuntimeError(f"腾讯klines空 node键={list(node.keys())[:6]}")
-    out = []
-    for row in arr:
-        if len(row) < 3:
-            continue
-        try:
-            out.append((row[0], float(row[2])))
-        except Exception:
-            continue
-    if not out:
-        raise RuntimeError("腾讯解析0条")
-    return out
+    return market_data.fetch_index_kline(secid, ssl_context=_SSL)
 
 
 # ---------- 粘贴文本解析 ----------
@@ -2851,36 +2376,7 @@ def save_trades(t):
 def replay_trades(code, nav_map, trades, account=None):
     """按流水逐笔回放，推导该只“应有”持仓三值(shares/cost/principal)。
        account=None 表示不过滤账户（合并回放）。"""
-    sh = cost = prin = 0.0
-    dds = sorted(nav_map)
-    for t in trades:
-        if t.get("code") != code: continue
-        if account is not None and (t.get("account") or DEFAULT_ACCOUNT) != account: continue
-        ds = t.get("date", "")
-        nav = nav_map.get(ds)
-        if not nav:
-            cand = [d for d in dds if d <= ds]
-            nav = nav_map[cand[-1]] if cand else 0.0
-        if nav <= 0: continue
-        amt = float(t.get("amount") or 0); tsh = float(t.get("shares") or 0)
-        side = t.get("side")
-        if side == "buy":
-            add = tsh if tsh > 0 else amt / nav
-            if add <= 0: continue
-            sh += add; prin += (amt if amt > 0 else add * nav)
-            cost = prin / sh if sh else 0.0
-        elif side in ("sell", "convert"):
-            out = tsh if tsh > 0 else (amt / nav if amt else 0.0)
-            if out <= 0: continue
-            out = min(out, sh)
-            prin = max(prin - cost * out, 0.0); sh -= out
-            if sh <= 1e-9: sh = cost = prin = 0.0
-            else: cost = prin / sh
-        elif side == "open":
-            sh = tsh
-        elif side == "dividend_reinvest":
-            sh += amt / nav
-    return {"shares": sh, "cost": cost, "principal": prin}
+    return domain_logic.replay_trades(code, nav_map, trades, account, DEFAULT_ACCOUNT)
 
 class PnlDialog(QDialog):
     """收益明细：收益总览 + 收益日历(红涨绿跌) + 当日明细。
