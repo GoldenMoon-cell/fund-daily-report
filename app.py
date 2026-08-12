@@ -114,7 +114,7 @@ SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
 SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -1473,8 +1473,24 @@ class DetailPage(QWidget):
         self.btn_back.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#f0f0f0;border:none;}QPushButton:hover{background:#e3e3e3;}")
         self.btn_back.clicked.connect(on_back); top.addWidget(self.btn_back)
         self.lbl_title = QLabel("基金详情"); self.lbl_title.setFont(QFont(FONT,14,QFont.Bold)); top.addWidget(self.lbl_title)
-        top.addStretch()
-        self.lbl_my = QLabel(""); self.lbl_my.setFont(QFont(FONT,10)); top.addWidget(self.lbl_my); lay.addLayout(top)
+        top.addStretch(); lay.addLayout(top)
+        # v2.2.0 逐屏精细化·详情页：摘要大字区（净值/持有市值/累计盈亏）——详情页的主角
+        t0 = T()
+        sum_box = QFrame(); sum_box.setStyleSheet(panel_qss()); self.sum_box = sum_box
+        sl = QHBoxLayout(sum_box); sl.setContentsMargins(16,10,16,10); sl.setSpacing(0)
+        self._sum_caps = []
+        def _sum_col(cap):
+            box = QVBoxLayout(); box.setSpacing(2)
+            a = QLabel(cap); a.setFont(QFont(FONT,8)); a.setAlignment(Qt.AlignCenter); a.setStyleSheet(f"color:{t0['muted']};")
+            b = QLabel("—"); b.setFont(QFont(FONT,16,QFont.Bold)); b.setAlignment(Qt.AlignCenter); b.setStyleSheet(f"color:{t0['text']};")
+            box.addWidget(a); box.addWidget(b); self._sum_caps.append(a); return box, b
+        _c1, self.d_nav_val = _sum_col("最新净值")
+        _c2, self.d_mv_val = _sum_col("持有市值")
+        _c3, self.d_pnl_val = _sum_col("累计盈亏")
+        for _c in (_c1, _c2, _c3): sl.addLayout(_c, 1)
+        lay.addWidget(sum_box)
+        self.d_sub = QLabel(""); self.d_sub.setFont(QFont(FONT,8)); self.d_sub.setStyleSheet(f"color:{t0['muted']};")
+        self.d_sub.setAlignment(Qt.AlignCenter); lay.addWidget(self.d_sub)
         self.lbl_track = QLabel(""); self.lbl_track.setFont(QFont(FONT,8))
         self.lbl_track.setStyleSheet("QLabel{color:#6b7280;background:#f7f9fc;border:1px solid #eef0f3;border-radius:6px;padding:4px 8px;}")
         self.lbl_track.setWordWrap(True); self.lbl_track.hide(); lay.addWidget(self.lbl_track)
@@ -1512,6 +1528,7 @@ class DetailPage(QWidget):
         dl.addWidget(self.lbl_dd_max); dl.addSpacing(28); dl.addWidget(self.lbl_dd_rep); dl.addStretch()
         self.dd_box.hide(); lay.addWidget(self.dd_box)
         chart_box = QFrame(); chart_box.setStyleSheet(board_qss())  # v1.7 令牌化
+        self.chart_box = chart_box  # v2.2.0 返工：存引用供 _apply_theme 重刷（防切主题后框色冻结）
         cl = QVBoxLayout(chart_box); cl.setContentsMargins(8,8,8,8)
         self._date_axis = DateAxis(orientation='bottom')
         self.plot = pg.PlotWidget(axisItems={'bottom': self._date_axis})
@@ -1578,10 +1595,10 @@ class DetailPage(QWidget):
     def _apply_theme(self):
         """v2.0.0：详情页主题适配（背景/面板/按钮组/图表）。"""
         t = T()
+        self.setAttribute(Qt.WA_StyledBackground, True)  # v2.2.0 返工：纯 QWidget 的 QSS 背景必须显式开启才生效，否则填系统默认浅色（半黑灾难根因）
         self.setAutoFillBackground(True)
         self.setStyleSheet(f"QWidget#detailRoot{{background:{t['win_bg']};}}" if t["win_bg"] else "")
         self.lbl_title.setStyleSheet(f"color:{t['text']};")
-        self.lbl_my.setStyleSheet(f"color:{t['text_sub']};")
         _tip = f"QLabel{{color:{t['text_sub']};background:{t['panel_bg']};border:1px solid {t['panel_border']};border-radius:6px;padding:4px 8px;}}"
         self.lbl_track.setStyleSheet(_tip); self.lbl_valinfo.setStyleSheet(_tip)
         self.btn_back.setStyleSheet(ghost_btn_qss(t, pad="8px 14px"))
@@ -1589,17 +1606,39 @@ class DetailPage(QWidget):
                f"QPushButton:checked{{background:{t['accent']};color:#ffffff;border-color:{t['accent']};}}")
         for b in self._vbtns.values(): b.setStyleSheet(_vb)
         for b in self._rbtns.values(): b.setStyleSheet(_vb)
-        self._cmp_combo.setStyleSheet(f"QComboBox{{padding:4px 8px;border:1px solid {t['card_border']};border-radius:7px;background:{t['card_bg']};color:{t['text']};}}")
+        self._cmp_combo.setStyleSheet(combo_qss(t))  # v2.2.0 返工：统一 Win11 风（含箭头子控件，原内联无子控件样式）
         self._cmp_lbl.setStyleSheet(f"color:{t['muted']};font-size:9px;")
         self._cmp_hint.setStyleSheet(f"color:{t['mid_val']};font-size:8px;")
         self.dd_box.setStyleSheet(f"QFrame{{background:{t['hover_bg']};border:1px solid {t['card_border']};border-radius:10px;}}")
-        self.lbl_dd_max.setStyleSheet(f"color:{t['up']};"); self.lbl_dd_rep.setStyleSheet(f"color:{t['muted']};")
+        self._update_dd_stats()  # v2.2.0：回撤条文字按新令牌重着
         self.plot.setBackground(QColor(t["card_bg"]))
         for _axn in ("left", "bottom"):
             _a = self.plot.getAxis(_axn); _a.setTextPen(QColor(t["muted"])); _a.setPen(QColor(t["card_border"]))
+        self.chart_box.setStyleSheet(board_qss())  # v2.2.0 返工：图表外框容器随主题重刷（用户捆出“走势图周围一圈白色”）
+        # v2.2.0 返工：图表曲线/标记色随主题令牌（原主曲线写死 #2563eb，纸账本主题下按钮已变红曲线还是蓝）
+        self._curve.setPen(pg.mkPen(t["accent"], width=2))
+        self._dot.setBrush(pg.mkBrush(t["accent"]))
+        self._dd_curve.setPen(pg.mkPen(t["up"], width=2))
+        self._dd_marker.setBrush(pg.mkBrush(t["up"]))
+        self._dd_label.setColor(QColor(t["up"]))
+        self._zero_line.setPen(pg.mkPen(t["down"], width=1.6, style=Qt.DashLine))
+        self._zero_label.setColor(QColor(t["down"]))
+        self._repair_marker.setBrush(pg.mkBrush(t["down"]))
+        self._repair_label.setColor(QColor(t["down"]))
+        self._region_label.setColor(QColor(t["mid_val"]))
+        # v2.2.0：摘要区/明细表/加载提示/图表浮层随主题重刷（双路径铁律）
+        self.sum_box.setStyleSheet(panel_qss())
+        for cap in self._sum_caps: cap.setStyleSheet(f"color:{t['muted']};")
+        self._update_my_pnl()  # 数值颜色数据驱动，重算即重着
+        self.d_sub.setStyleSheet(f"color:{t['muted']};")
+        self.table.setStyleSheet(table_qss("font-size:12px;"))
+        self._loading.setStyleSheet(f"color:{t['muted']};")
+        _fl = f"QLabel{{background:{t['card_bg']};border:1px solid {t['card_border']};border-radius:6px;padding:4px 8px;color:{t['text_sub']};font-size:9px;}}"
+        self._legend.setStyleSheet(_fl)
+        self._readout.setStyleSheet(f"QLabel{{background:{t['card_bg']};border:1px solid {t['card_border']};border-radius:6px;padding:5px 8px;color:{t['text_sub']};}}")
 
-    def load(self, code, rec2, val=None):
-        self._code = code; self.lbl_title.setText(f"{NAME_MAP.get(code,'')}  详情")
+    def load(self, code, rec2, val=None, chg=None):
+        self._code = code; self._chg = chg; self.lbl_title.setText(f"{NAME_MAP.get(code,'')}  详情")
         vt = val_detail_text(val) if val else ""  # v1.5：完整估值面板
         if vt:
             self.lbl_valinfo.setText("🧭 " + vt + "｜仅信息展示，不构成投资建议"); self.lbl_valinfo.show()
@@ -1610,7 +1649,7 @@ class DetailPage(QWidget):
             self.lbl_track.setText(f"📌 {tk[0]} ｜ {tk[1]}"); self.lbl_track.show()
         else:
             self.lbl_track.hide()
-        self.lbl_my.setText(""); self._full=[]; self._hist=[]; self._dd=[]
+        self._reset_summary(); self._full=[]; self._hist=[]; self._dd=[]
         self._dd_state="none"; self._dd_days=0; self._dd_progress=0.0; self._repair_idx=None
         self._buy_date = load_holdings().get(code, {}).get("buy_date", "") or ""
         self._buy_date = self._buy_date.strip()
@@ -1943,29 +1982,56 @@ class DetailPage(QWidget):
         if self._view != "dd":
             self.dd_box.hide(); return
         self.dd_box.show()
+        t = T()  # v2.2.0：回撤条文字改主题令牌（原硬编码色暗底失真）
         st = self._dd_state
         if st == "none" or not self._hist:
-            self.lbl_dd_max.setText("最大回撤  暂无明显回撤"); self.lbl_dd_max.setStyleSheet("color:#16a34a;font-weight:bold;")
-            self.lbl_dd_rep.setText("修复  —"); self.lbl_dd_rep.setStyleSheet("color:#888;font-weight:bold;")
+            self.lbl_dd_max.setText("最大回撤  暂无明显回撤"); self.lbl_dd_max.setStyleSheet(f"color:{t['down']};font-weight:bold;")
+            self.lbl_dd_rep.setText("修复  —"); self.lbl_dd_rep.setStyleSheet(f"color:{t['muted']};font-weight:bold;")
         else:
-            self.lbl_dd_max.setText(f"最大回撤  {abs(self._dd_max):.2f}%"); self.lbl_dd_max.setStyleSheet("color:#c0392b;font-weight:bold;")
+            self.lbl_dd_max.setText(f"最大回撤  {abs(self._dd_max):.2f}%"); self.lbl_dd_max.setStyleSheet(f"color:{t['up']};font-weight:bold;")
             if st == "yes":
-                self.lbl_dd_rep.setText(f"修复  已修复 {self._dd_days} 天"); self.lbl_dd_rep.setStyleSheet("color:#16a34a;font-weight:bold;")
+                self.lbl_dd_rep.setText(f"修复  已修复 {self._dd_days} 天"); self.lbl_dd_rep.setStyleSheet(f"color:{t['down']};font-weight:bold;")
             elif st == "fixing":
-                self.lbl_dd_rep.setText(f"修复  正在修复中 · 已填{self._dd_progress*100:.0f}%"); self.lbl_dd_rep.setStyleSheet("color:#ea580c;font-weight:bold;")
+                self.lbl_dd_rep.setText(f"修复  正在修复中 · 已填{self._dd_progress*100:.0f}%"); self.lbl_dd_rep.setStyleSheet(f"color:{t['mid_val']};font-weight:bold;")
             else:
-                self.lbl_dd_rep.setText(f"修复  暂未修复 · 已填{self._dd_progress*100:.0f}%"); self.lbl_dd_rep.setStyleSheet("color:#64748b;font-weight:bold;")
+                self.lbl_dd_rep.setText(f"修复  暂未修复 · 已填{self._dd_progress*100:.0f}%"); self.lbl_dd_rep.setStyleSheet(f"color:{t['muted']};font-weight:bold;")
+
+    def _reset_summary(self):
+        """v2.2.0：摘要区复位为占位态。"""
+        t = T()
+        self.d_nav_val.setText("—"); self.d_nav_val.setStyleSheet(f"color:{t['faint']};")
+        self.d_mv_val.setText("—"); self.d_mv_val.setStyleSheet(f"color:{t['faint']};")
+        self.d_pnl_val.setText("—"); self.d_pnl_val.setStyleSheet(f"color:{t['faint']};")
+        self.d_sub.setText("")
 
     def _update_my_pnl(self):
+        """v2.2.0：摘要大字区（净值/市值/累计盈亏）+副行（份额·成本·今日·截至）。"""
+        t = T()
         sh = float(self._my_rec2.get("shares") or 0); cost = float(self._my_rec2.get("cost") or 0)
-        if not self._hist or not sh:
-            self.lbl_my.setText("未填持仓（点顶栏「💼 管理持仓」填写）"); self.lbl_my.setStyleSheet("color:#999;"); return
-        nav = self._hist[-1][1]; mv = nav*sh
+        if not self._hist:
+            self._reset_summary(); return
+        nav = self._hist[-1][1]
+        nd = datetime.fromtimestamp(self._hist[-1][0]/1000).strftime("%m-%d")
+        self.d_nav_val.setText(f"{nav:.4f}"); self.d_nav_val.setStyleSheet(f"color:{t['text']};")
+        if not sh:
+            self.d_mv_val.setText("未填持仓"); self.d_mv_val.setStyleSheet(f"color:{t['faint']};font-size:10px;")
+            self.d_pnl_val.setText("未填持仓"); self.d_pnl_val.setStyleSheet(f"color:{t['faint']};font-size:10px;")
+            self.d_sub.setText(f"未填持仓（点顶栏「管理持仓」填写） · 截至{nd}"); return
+        mv = nav * sh
+        self.d_mv_val.setText(f"¥{mv:,.2f}"); self.d_mv_val.setStyleSheet(f"color:{t['text']};")
+        parts = [f"份额 {sh:,.2f}"]
+        if cost > 0: parts.append(f"成本 {cost:.4f}")
+        _chg = getattr(self, "_chg", None)
+        if _chg is not None and (100 + _chg) != 0:
+            tp = sh * nav * _chg / (100 + _chg)
+            parts.append(f"今日 {tp:+,.2f}元")
+        parts.append(f"截至{nd}")
+        self.d_sub.setText(" · ".join(parts))
         if cost <= 0:
-            self.lbl_my.setText(f"你的持仓：{sh:.0f}份 市值{mv:,.2f}（未填成本）"); self.lbl_my.setStyleSheet("color:#999;"); return
-        pnl = (nav-cost)*sh; pct = (nav-cost)/cost*100; pc = RED if pnl>=0 else GREEN
-        self.lbl_my.setText(f"你的持仓：{sh:.0f}份 成本{cost:.4f} 市值{mv:,.2f}  盈亏 {pnl:+,.2f}元({pct:+.2f}%)")
-        self.lbl_my.setStyleSheet(f"color:{pc};font-weight:bold;")
+            self.d_pnl_val.setText("未填成本"); self.d_pnl_val.setStyleSheet(f"color:{t['faint']};font-size:10px;"); return
+        pnl = (nav-cost)*sh; pct = (nav-cost)/cost*100
+        self.d_pnl_val.setText(f"{pnl:+,.2f}元 ({pct:+.2f}%)")
+        self.d_pnl_val.setStyleSheet(f"color:{RED if pnl>=0 else GREEN};")
 
     def _mouse_moved(self, pos):
         if not self._hist: return
@@ -2859,7 +2925,8 @@ class PnlDialog(QDialog):
         self.btn_prev.clicked.connect(lambda: self._shift(-1)); self.btn_next.clicked.connect(lambda: self._shift(1))
         self.lbl_month = QLabel(""); self.lbl_month.setFont(QFont(FONT,12,QFont.Bold)); self.lbl_month.setAlignment(Qt.AlignCenter)
         self.lbl_month.setStyleSheet(f"color:{t['text']};")
-        nav.addWidget(self.btn_prev); nav.addWidget(self.lbl_month,1); nav.addWidget(self.btn_next); L.addLayout(nav)
+        self.lbl_mtot = QLabel(""); self.lbl_mtot.setFont(QFont(FONT,12,QFont.Bold))  # v2.2.0：当月合计置顶
+        nav.addWidget(self.btn_prev); nav.addWidget(self.lbl_month,1); nav.addWidget(self.lbl_mtot); nav.addWidget(self.btn_next); L.addLayout(nav)
         self.grid = QGridLayout(); self.grid.setSpacing(4)
         for c, wt in enumerate(("日","一","二","三","四","五","六")):
             h = QLabel(wt); h.setAlignment(Qt.AlignCenter); h.setStyleSheet(f"color:{t['muted']};font-weight:bold;")
@@ -2869,7 +2936,8 @@ class PnlDialog(QDialog):
             row = []
             for c in range(7):
                 cell = QLabel(""); cell.setAlignment(Qt.AlignCenter)
-                cell.setFixedSize(96, 54); cell.setCursor(QCursor(Qt.PointingHandCursor))
+                cell.setFixedSize(104, 60); cell.setFont(QFont(FONT,10,QFont.Bold))  # v2.2.0：格子加大、数字加粗
+                cell.setCursor(QCursor(Qt.PointingHandCursor))
                 cell.mousePressEvent = lambda ev, rr=r, cc=c: self._click(rr, cc)
                 self.grid.addWidget(cell, r+1, c); row.append(cell)
             self._cells.append(row)
@@ -3060,21 +3128,26 @@ class PnlDialog(QDialog):
         today = datetime.now().strftime("%Y-%m-%d")
         t = T()  # v2.0.0：日历格子全主题适配（底色混合而非固定浅色）
         _empty = f"QLabel{{background:{t['panel_bg']};border-radius:8px;color:{t['faint']};}}"
+        # v2.2.0：当月合计置顶（红绿信号色，随 set_theme 同步的 RED/GREEN）
+        _mtot = sum(day_pnl.values())
+        self.lbl_mtot.setText(f"合计 {_mtot:+,.2f}元")
+        self.lbl_mtot.setStyleSheet(f"color:{RED if _mtot > 1e-9 else (GREEN if _mtot < -1e-9 else GRAY)};")
         for row in self._cells:
             for cell in row:
                 cell.setText(""); cell.setProperty("ds", ""); cell.setStyleSheet(_empty)
         for d in range(1, ndays+1):
             ds = f"{y:04d}-{m:02d}-{d:02d}"; idx = first_wd + d - 1
             cell = self._cells[idx//7][idx%7]; cell.setProperty("ds", ds)
+            _tb = f"border:2px solid {t['accent']};" if ds == today else ""  # v2.2.0：今日描边
             if getattr(self, "_start", "") and ds < self._start:
                 cell.setText(f"{d}\n—"); cell.setStyleSheet(_empty)
             elif ds in day_pnl and abs(day_pnl[ds]) > 1e-9:
                 v = day_pnl[ds]; a = min(abs(v)/vmax, 1.0)
                 bg = blend_color(t["card_bg"], t["up"] if v >= 0 else t["down"], 0.18+0.45*a)
                 cell.setText(f"{d}\n{v:+.2f}")
-                cell.setStyleSheet(f"QLabel{{background:{bg};border-radius:8px;color:{t['text']};font-weight:bold;}}QLabel:hover{{border:2px solid {t['accent']};}}")
+                cell.setStyleSheet(f"QLabel{{background:{bg};border-radius:8px;color:{t['text']};font-weight:bold;{_tb}}}QLabel:hover{{border:2px solid {t['accent']};}}")
             elif (idx % 7) in (0, 6) or ds < today:
-                cell.setText(f"{d}\n0.00"); cell.setStyleSheet(f"QLabel{{background:{t['hover_bg']};border-radius:8px;color:{t['muted']};}}QLabel:hover{{border:2px solid {t['accent']};}}")
+                cell.setText(f"{d}\n0.00"); cell.setStyleSheet(f"QLabel{{background:{t['hover_bg']};border-radius:8px;color:{t['muted']};{_tb}}}QLabel:hover{{border:2px solid {t['accent']};}}")
             else:
                 cell.setText(f"{d}\n—"); cell.setStyleSheet(_empty)
         if self._sel and self._sel[:7] == f"{y:04d}-{m:02d}": self._show_day(self._sel)
@@ -3444,6 +3517,7 @@ class MainWindow(QMainWindow):
 
     def _build_home(self):
         w = QWidget(); w.setObjectName("homeRoot"); w.setAutoFillBackground(True)  # v1.7：主题窗口底
+        w.setAttribute(Qt.WA_StyledBackground, True)  # v2.2.0 返工：同详情页，纯 QWidget 的 QSS 背景需显式开启
         _t0 = T()
         if _t0["win_bg"]: w.setStyleSheet(f"#homeRoot{{background:{_t0['win_bg']};}}")
         self._home_root = w
@@ -4022,7 +4096,10 @@ class MainWindow(QMainWindow):
         if self.last_results:
             self._apply_results()
 
-    def _open_detail(self, code): self.detail.load(code, self.resolved.get(code, {}), (self._val_cache.get("pct") or {}).get(code)); self.stack.setCurrentIndex(1)
+    def _open_detail(self, code):
+        # v2.2.0：把当日涨跌幅传给详情页副行（今日盈亏）
+        _chg = next((d.get("chg") for d in self.last_results if d.get("code") == code and d.get("status") == "ok"), None)
+        self.detail.load(code, self.resolved.get(code, {}), (self._val_cache.get("pct") or {}).get(code), _chg); self.stack.setCurrentIndex(1)
     def _go_home(self): self.stack.setCurrentIndex(0)
 
     def _redraw_aggregates(self):
