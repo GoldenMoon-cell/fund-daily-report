@@ -61,6 +61,36 @@ def atomic_write_bytes(path, payload):
         raise
 
 
+def atomic_write_json_group(entries):
+    """Atomically commit several JSON files as one logical transaction.
+
+    ``entries`` maps paths to ``(data, json_kwargs)``. Each individual replace
+    is atomic; if any replace fails, every primary and backup file is restored
+    byte-for-byte to its pre-transaction state.
+    """
+    originals = {}
+    for path in entries:
+        for target in (path, path + ".bak"):
+            originals[target] = open(target, "rb").read() if os.path.exists(target) else None
+    try:
+        for path, (data, kwargs) in entries.items():
+            atomic_write_json(path, data, **(kwargs or {}))
+    except Exception:
+        rollback_error = None
+        for path, payload in originals.items():
+            try:
+                if payload is None:
+                    if os.path.exists(path):
+                        os.remove(path)
+                else:
+                    atomic_write_bytes(path, payload)
+            except Exception as exc:
+                rollback_error = rollback_error or exc
+        if rollback_error:
+            raise RuntimeError(f"保存失败，自动回滚也未完全成功：{rollback_error}")
+        raise
+
+
 def load_json_with_bak(path, default):
     """Load JSON, restoring a valid ``.bak`` when the primary file is broken."""
     try:

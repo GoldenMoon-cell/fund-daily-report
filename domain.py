@@ -321,6 +321,165 @@ def replay_trades(code, nav_map, trades, account=None, default_account="默认")
                 cost = principal / shares
         elif side == "open":
             shares = trade_shares
+            principal = max(float(trade.get("principal") or 0), 0.0)
+            cost = principal / shares if shares > 0 else 0.0
         elif side == "dividend_reinvest":
             shares += amount / nav
     return {"shares": shares, "cost": cost, "principal": principal}
+
+
+def ledger_report(holdings, price_map, trades, account=None, default_account="默认", codes=None):
+    """Build an auditable profit report from holdings and transaction records.
+
+    The report intentionally refuses to invent a cost basis. Old snapshots and
+    records that lack amount/shares are labelled as incomplete instead of being
+    used to manufacture realized profit. ``total`` is valid only when every
+    included code is reconciled with the current holding record.
+    """
+    # For the all-account view accept the persisted nested structure and keep
+    # each account's cost basis independent before aggregating totals.
+    if account is None and holdings and all(isinstance(value, dict) for value in holdings.values()) \
+            and not any(key in holdings for key in ("shares", "cost", "principal")) \
+            and not any(str(key).isdigit() for key in holdings):
+        account_names = set(holdings)
+        account_names.update((t.get("account") or default_account) for t in (trades or []) if isinstance(t, dict))
+        reports = [ledger_report(holdings.get(account_name, {}), price_map, trades, account_name,
+                                 default_account, codes)
+                   for account_name in sorted(account_names)]
+        details = []
+        for report in reports:
+            details.extend(report["rows"])
+        # Empty accounts are valid containers and must not make the combined
+        # ledger look incomplete.
+        active_reports = [report for report in reports if report["rows"]]
+        can_total = bool(details) and all(report["trusted"] for report in active_reports)
+        return {
+            "rows": details, "trusted": can_total,
+            "market_value": round(sum(report["market_value"] for report in reports), 2),
+            "principal": round(sum(report["principal"] for report in reports), 2),
+            "invested": round(sum(report["invested"] for report in reports), 2),
+            "unrealized": round(sum(report["unrealized"] for report in reports), 2),
+            "realized": round(sum(report["realized"] for report in reports), 2),
+            "cash_dividend": round(sum(report["cash_dividend"] for report in reports), 2),
+            "total": round(sum(report["total"] or 0 for report in reports), 2) if can_total else None,
+            "issues": sum(report["issues"] for report in reports),
+        }
+
+    rows = [t for t in (trades or []) if isinstance(t, dict)
+            and (account is None or (t.get("account") or default_account) == account)]
+    related = set((holdings or {}).keys())
+    related.update(str(t.get("code") or "") for t in rows if t.get("code"))
+    selected = related & set(codes) if codes is not None else related
+    details = []
+
+    def number(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for code in sorted(selected):
+        if not code:
+            continue
+        current = (holdings or {}).get(code) or {}
+        current_shares = number(current.get("shares"))
+        current_principal = number(current.get("principal"))
+        if current_principal <= 0 and current_shares > 0:
+            current_principal = number(current.get("cost")) * current_shares
+        nav = number((price_map or {}).get(code))
+        market_value = current_shares * nav if nav > 0 else 0.0
+        code_rows = sorted((t for t in rows if t.get("code") == code),
+                           key=lambda t: str(t.get("date") or ""))
+        issues = []
+        replay_shares = replay_principal = realized = cash_dividend = invested = 0.0
+        replay_ready = bool(code_rows)
+
+        if not code_rows and (current_shares > 0 or current_principal > 0):
+            issues.append("缺少交易流水")
+        for trade in code_rows:
+            side = trade.get("side")
+            shares = number(trade.get("shares"))
+            amount = number(trade.get("amount"))
+            if side == "open":
+                has_principal = "principal" in trade or "amount" in trade
+                principal = number(trade.get("principal") if "principal" in trade else trade.get("amount"))
+                if shares <= 0 or not has_principal or principal < 0:
+                    issues.append("期初快照缺少份额或本金")
+                    replay_ready = False
+                    continue
+                replay_shares, replay_principal = shares, principal
+                invested += principal
+            elif side == "buy":
+                if shares <= 0 or amount <= 0:
+                    issues.append("买入流水缺少确认份额或金额")
+                    replay_ready = False
+                    continue
+                replay_shares += shares
+                replay_principal += amount
+                invested += amount
+            elif side in ("sell", "convert"):
+                if shares <= 0 or amount <= 0:
+                    issues.append("卖出流水缺少确认份额或金额")
+                    replay_ready = False
+                    continue
+                if shares > replay_shares + 1e-6:
+                    issues.append("卖出份额超过流水可回放份额")
+                    replay_ready = False
+                    continue
+                unit_cost = replay_principal / replay_shares if replay_shares > 0 else 0.0
+                realized += amount - unit_cost * shares
+                replay_shares -= shares
+                replay_principal = max(replay_principal - unit_cost * shares, 0.0)
+            elif side == "dividend_cash":
+                if amount <= 0:
+                    issues.append("现金分红流水缺少金额")
+                    replay_ready = False
+                    continue
+                cash_dividend += amount
+            elif side == "dividend_reinvest":
+                if shares <= 0:
+                    issues.append("红利再投流水缺少确认份额")
+                    replay_ready = False
+                    continue
+                replay_shares += shares
+            else:
+                issues.append("存在无法识别的流水类型")
+                replay_ready = False
+
+        share_gap = current_shares - replay_shares
+        principal_gap = current_principal - replay_principal
+        share_tolerance = max(0.01, current_shares * 0.005, replay_shares * 0.005)
+        principal_tolerance = max(0.05, current_principal * 0.005, replay_principal * 0.005)
+        if replay_ready and (abs(share_gap) > share_tolerance or abs(principal_gap) > principal_tolerance):
+            issues.append("当前持仓与流水回放不一致")
+        if current_shares > 1e-9 and nav <= 0:
+            issues.append("缺少当前净值，请先刷新数据")
+        trusted = replay_ready and not issues
+        # A fully closed position has no remaining market-value uncertainty.
+        unrealized = market_value - current_principal if nav > 0 else (0.0 if current_shares <= 1e-9 else None)
+        total = (unrealized + realized + cash_dividend) if (trusted and unrealized is not None) else None
+        details.append({
+            "code": code, "account": account or default_account,
+            "market_value": market_value, "shares": current_shares,
+            "principal": current_principal, "unrealized": unrealized,
+            "realized": realized, "cash_dividend": cash_dividend, "total": total,
+            "invested": invested,
+            "replay_shares": replay_shares, "replay_principal": replay_principal,
+            "share_gap": share_gap, "principal_gap": principal_gap,
+            "trusted": trusted, "issues": list(dict.fromkeys(issues)),
+        })
+
+    trusted_rows = [row for row in details if row["trusted"]]
+    can_total = bool(details) and len(trusted_rows) == len(details) and all(row["total"] is not None for row in details)
+    return {
+        "rows": details,
+        "trusted": can_total,
+        "market_value": round(sum(row["market_value"] for row in details), 2),
+        "principal": round(sum(row["principal"] for row in details), 2),
+        "invested": round(sum(row["invested"] for row in details), 2),
+        "unrealized": round(sum(row["unrealized"] or 0 for row in details), 2),
+        "realized": round(sum(row["realized"] for row in details), 2),
+        "cash_dividend": round(sum(row["cash_dividend"] for row in details), 2),
+        "total": round(sum(row["total"] or 0 for row in details), 2) if can_total else None,
+        "issues": sum(len(row["issues"]) for row in details),
+    }
