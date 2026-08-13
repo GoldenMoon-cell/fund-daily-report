@@ -134,6 +134,20 @@ def combo_qss(tokens):
             f"QComboBox::down-arrow{{image:url({arrow});width:12px;height:8px;margin-right:8px;}}")
 
 
+def date_edit_qss(tokens):
+    """Calendar-popup date field matching the flat combo-box treatment."""
+    arrow = arrow_png("down", tokens["muted"])
+    return (f"QDateEdit{{padding:6px 32px 6px 10px;border:1px solid {tokens['card_border']};border-radius:6px;"
+            f"background:{tokens['card_bg']};color:{tokens['text']};}}"
+            f"QDateEdit:hover{{border-color:{tokens['muted']};}}"
+            f"QDateEdit:focus{{border-color:{tokens['accent']};}}"
+            f"QDateEdit::drop-down{{subcontrol-origin:padding;subcontrol-position:top right;width:28px;"
+            f"border:none;border-left:1px solid {tokens['card_border']};background:transparent;"
+            f"border-top-right-radius:6px;border-bottom-right-radius:6px;}}"
+            f"QDateEdit::drop-down:hover{{background:{tokens['hover_bg']};}}"
+            f"QDateEdit::down-arrow{{image:url({arrow});width:12px;height:8px;}}")
+
+
 def input_qss(tokens):
     return f"QLineEdit{{padding:6px 8px;border:1px solid {tokens['card_border']};border-radius:6px;background:{tokens['card_bg']};color:{tokens['text']};}}"
 
@@ -165,16 +179,22 @@ def global_qss(tokens):
             f"QDialog QComboBox,QMessageBox QComboBox{{padding:6px 12px;border:1px solid {tokens['card_border']};border-radius:6px;background:{tokens['card_bg']};color:{tokens['text']};}}"
             f"QDialog QComboBox::drop-down,QMessageBox QComboBox::drop-down{{border:none;width:26px;}}"
             f"QDialog QComboBox::down-arrow,QMessageBox QComboBox::down-arrow{{image:url({arrow_png('down', tokens['muted'])});width:12px;height:8px;margin-right:8px;}}"
-            f"QDialog QDateEdit::up-button,QDialog QDateEdit::down-button{{border:none;width:16px;background:transparent;}}"
-            f"QDialog QDateEdit::up-arrow{{image:url({arrow_png('up', tokens['muted'])});width:10px;height:7px;}}"
-            f"QDialog QDateEdit::down-arrow{{image:url({arrow_png('down', tokens['muted'])});width:10px;height:7px;}}"
+            f"QDialog QDateEdit::drop-down{{subcontrol-origin:padding;subcontrol-position:top right;width:28px;border:none;border-left:1px solid {tokens['card_border']};background:transparent;}}"
+            f"QDialog QDateEdit::drop-down:hover{{background:{tokens['hover_bg']};}}"
+            f"QDialog QDateEdit::down-arrow{{image:url({arrow_png('down', tokens['muted'])});width:12px;height:8px;}}"
             f"QComboBox QAbstractItemView{{background:{tokens['card_bg']};color:{tokens['text']};border:1px solid {tokens['card_border']};selection-background-color:{tokens['accent_soft']};selection-color:{tokens['accent']};}}"
             f"QDialog QTextEdit,QDialog QLineEdit,QDialog QDateEdit{{background:{win_bg};color:{tokens['text']};border:1px solid {tokens['card_border']};border-radius:6px;padding:4px;}}"
             f"QDialog QCheckBox,QDialog QRadioButton{{color:{tokens['text']};}}"
+            f"QMenu{{background:{tokens['card_bg']};color:{tokens['text']};border:1px solid {tokens['card_border']};padding:4px;}}"
+            f"QMenu::item{{padding:7px 24px 7px 10px;border-radius:4px;}}"
+            f"QMenu::item:selected{{background:{tokens['hover_bg']};color:{tokens['accent']};}}"
             f"QDialog QTableWidget{{background:{tokens['card_bg']};alternate-background-color:{tokens['panel_bg']};color:{tokens['text']};gridline-color:{tokens['card_border']};border:1px solid {tokens['card_border']};}}"
             f"QDialog QHeaderView::section{{background:{tokens['panel_bg']};color:{tokens['text_sub']};border:none;padding:4px;}}"
             f"QCalendarWidget{{background:{tokens['card_bg']};color:{tokens['text']};}}"
-            f"QCalendarWidget QToolButton{{color:{tokens['text']};}}"
+            f"QCalendarWidget QWidget#qt_calendar_navigationbar{{background:{tokens['panel_bg']};}}"
+            f"QCalendarWidget QToolButton{{color:{tokens['text']};background:transparent;border:none;border-radius:4px;padding:4px;}}"
+            f"QCalendarWidget QToolButton:hover{{background:{tokens['hover_bg']};}}"
+            f"QCalendarWidget QAbstractItemView{{background:{tokens['card_bg']};color:{tokens['text']};selection-background-color:{tokens['accent']};selection-color:#ffffff;}}"
             f"QScrollArea{{border:none;background:transparent;}}"
             f"QToolTip{{background:{tokens['card_bg']};color:{tokens['text']};border:1px solid {tokens['card_border']};}}"
             f"QScrollBar:vertical{{background:transparent;width:10px;}}"

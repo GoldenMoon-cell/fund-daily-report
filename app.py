@@ -10,7 +10,6 @@ import re
 import traceback
 import numpy as np
 import os
-import zipfile
 from datetime import datetime, timedelta
 
 from PySide6.QtWidgets import (
@@ -20,7 +19,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QAbstractItemView, QButtonGroup, QGraphicsOpacityEffect,
     QComboBox, QLineEdit, QFileDialog, QSplitter, QCheckBox,
     QRadioButton, QFormLayout, QDateEdit, QGridLayout, QInputDialog,
-    QListWidget,
+    QListWidget, QMenu,
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, QTimer, QPropertyAnimation, QAbstractAnimation, QDate,
@@ -85,8 +84,10 @@ HOLD_FILE = "我的持仓.json"
 SHOW_FILE = "基金显示.json"   # 显示层状态(已清仓标记等)；缺席=默认，不碰持仓账本
 ACCOUNTS_FILE = "账户.json"    # v0.6 多账户
 SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
+DATA_VERSION_FILE = "数据版本.json"  # v2.4：独立 schema 清单，不改六类既有 JSON 顶层结构
+DATA_SCHEMA_VERSION = 1
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -138,6 +139,9 @@ def _arrow_png(kind, color):
 def combo_qss(t=None):
     """v2.0.0：下拉框 Win11 风格（圆角/扁平/手绘箭头，去原生斜边框）。"""
     return theme_ui.combo_qss(t or T())
+def date_edit_qss(t=None):
+    """日历下拉框：与普通下拉框共用扁平圆角和手绘箭头语言。"""
+    return theme_ui.date_edit_qss(t or T())
 def input_qss(t=None):
     return theme_ui.input_qss(t or T())
 def hl_bg():
@@ -195,6 +199,150 @@ def save_settings(d):
         _atomic_write_json(SETTINGS_FILE, d, indent=2)
     except Exception:
         pass
+
+
+def _data_paths():
+    """Runtime data names mapped to their current paths (tests may redirect them)."""
+    return {
+        os.path.basename(EXTRA_FILE): EXTRA_FILE,
+        os.path.basename(HOLD_FILE): HOLD_FILE,
+        os.path.basename(TRADES_FILE): TRADES_FILE,
+        os.path.basename(SHOW_FILE): SHOW_FILE,
+        os.path.basename(ACCOUNTS_FILE): ACCOUNTS_FILE,
+        os.path.basename(SETTINGS_FILE): SETTINGS_FILE,
+    }
+
+
+def _valid_number(value):
+    return value is None or (isinstance(value, (int, float)) and not isinstance(value, bool))
+
+
+def _validate_fund_list(data):
+    if not isinstance(data, list): return "应为基金列表"
+    for i, item in enumerate(data):
+        if not isinstance(item, dict): return f"第 {i + 1} 项不是对象"
+        if not re.fullmatch(r"\d{6}", str(item.get("code", "")).strip()): return f"第 {i + 1} 项基金代码无效"
+        if not str(item.get("name", "")).strip(): return f"第 {i + 1} 项缺少基金名称"
+    return None
+
+
+def _validate_holding_record(record, label):
+    if not isinstance(record, dict): return f"{label} 不是持仓对象"
+    for key in ("shares", "cost", "principal"):
+        if key in record and not _valid_number(record.get(key)): return f"{label} 的 {key} 不是数值"
+    date = record.get("buy_date")
+    if date not in (None, "") and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date)): return f"{label} 的买入日期无效"
+    return None
+
+
+def _validate_holdings(data):
+    if not isinstance(data, dict): return "应为持仓对象"
+    flat = any(re.fullmatch(r"\d{6}", str(key).strip()) for key in data)
+    groups = {DEFAULT_ACCOUNT: data} if flat else data
+    for account, holdings in groups.items():
+        if not str(account).strip() or not isinstance(holdings, dict): return "账户持仓结构无效"
+        for code, record in holdings.items():
+            if not re.fullmatch(r"\d{6}", str(code).strip()): return f"基金代码 {code} 无效"
+            error = _validate_holding_record(record, f"{account}/{code}")
+            if error: return error
+    return None
+
+
+def _validate_trades(data):
+    allowed = {"buy", "sell", "open", "dividend_reinvest", "dividend_cash"}
+    if not isinstance(data, list): return "应为交易列表"
+    for i, item in enumerate(data):
+        if not isinstance(item, dict): return f"第 {i + 1} 笔不是对象"
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(item.get("date", ""))): return f"第 {i + 1} 笔日期无效"
+        if not re.fullmatch(r"\d{6}", str(item.get("code", ""))): return f"第 {i + 1} 笔基金代码无效"
+        if item.get("side") not in allowed: return f"第 {i + 1} 笔类型无效"
+        for key in ("amount", "shares"):
+            if key in item and not _valid_number(item.get(key)): return f"第 {i + 1} 笔的 {key} 不是数值"
+    return None
+
+
+def _validate_show_state(data):
+    if not isinstance(data, dict): return "应为显示状态对象"
+    cleared = data.get("cleared", [])
+    if not isinstance(cleared, list) or any(not re.fullmatch(r"\d{6}", str(code)) for code in cleared): return "cleared 列表无效"
+    return None
+
+
+def _validate_accounts(data):
+    if not isinstance(data, list): return "应为账户列表"
+    for i, item in enumerate(data):
+        name = item.get("name") if isinstance(item, dict) else item
+        if not str(name or "").strip(): return f"第 {i + 1} 个账户名称为空"
+    return None
+
+
+def _validate_settings(data):
+    return None if isinstance(data, dict) else "应为设置对象"
+
+
+def _data_validators():
+    return {
+        os.path.basename(EXTRA_FILE): _validate_fund_list,
+        os.path.basename(HOLD_FILE): _validate_holdings,
+        os.path.basename(TRADES_FILE): _validate_trades,
+        os.path.basename(SHOW_FILE): _validate_show_state,
+        os.path.basename(ACCOUNTS_FILE): _validate_accounts,
+        os.path.basename(SETTINGS_FILE): _validate_settings,
+    }
+
+
+def current_data_manifest():
+    return {
+        "schema_version": DATA_SCHEMA_VERSION,
+        "app_version": APP_VERSION,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "files": {name: 1 for name in _data_paths()},
+    }
+
+
+def ensure_data_manifest():
+    manifest = current_data_manifest()
+    old = _load_json_with_bak(DATA_VERSION_FILE, {})
+    if not isinstance(old, dict) or old.get("schema_version") != DATA_SCHEMA_VERSION:
+        _atomic_write_json(DATA_VERSION_FILE, manifest, indent=2)
+    return manifest
+
+
+def inspect_data_backup(path):
+    return storage_layer.inspect_json_backup(
+        path, _data_validators(), os.path.basename(DATA_VERSION_FILE), DATA_SCHEMA_VERSION
+    )
+
+
+def _migrate_backup_holdings(data, source_version):
+    if isinstance(data, dict) and any(re.fullmatch(r"\d{6}", str(key).strip()) for key in data):
+        return {DEFAULT_ACCOUNT: data}
+    return data
+
+
+def create_data_backup(path):
+    manifest = ensure_data_manifest()
+    return storage_layer.create_json_backup(
+        path, _data_paths(), os.path.basename(DATA_VERSION_FILE), manifest
+    )
+
+
+def restore_data_backup(inspected, snapshot_path):
+    manifest_name = os.path.basename(DATA_VERSION_FILE)
+    transactional = dict(inspected)
+    transactional["files"] = dict(inspected.get("files", {}))
+    transactional["files"][manifest_name] = current_data_manifest()
+    targets = _data_paths(); targets[manifest_name] = DATA_VERSION_FILE
+    result = storage_layer.restore_json_backup(
+        transactional,
+        targets,
+        snapshot_path,
+        manifest_name,
+        current_data_manifest(),
+        {os.path.basename(HOLD_FILE): _migrate_backup_holdings},
+    )
+    result["restored"] = [name for name in result["restored"] if name != manifest_name]
+    return result
 
 def _migrate_holdings_if_needed(d):
     """v0.5→v0.6：旧扁平格式 {code: rec} → 新嵌套格式 {"默认": {code: rec}}。"""
@@ -2232,7 +2380,7 @@ class TradeDialog(QDialog):
         self.ed_date = QDateEdit(QDate.currentDate())
         self.ed_date.setCalendarPopup(True)
         self.ed_date.setDisplayFormat("yyyy-MM-dd")
-        self.ed_date.setStyleSheet(input_qss())
+        self.ed_date.setStyleSheet(date_edit_qss())
         F.addRow("交易日期", self.ed_date)
         self.ed_amt = QLineEdit()
         self.ed_amt.setPlaceholderText("买入=花的钱 卖出=到账的钱")
@@ -2674,7 +2822,7 @@ class PnlDialog(QDialog):
             self.tbl.setItem(r,3,QTableWidgetItem(""))
 
 class TradesDialog(QDialog):
-    """交易记录：查看流水 + 补录历史。
+    """交易记录：查看、补录与编辑历史流水。
        补录只写 trades.json，不动当前持仓（历史交易已含在手动持仓里，再过一遍会双计）。
        新交易在「管理持仓」记一笔时自动进流水，不用在这里重复录。
        （OCR 截图导入已移除。）"""
@@ -2686,7 +2834,7 @@ class TradesDialog(QDialog):
         self.setWindowTitle("交易记录")
         self.resize(780, 560)
         root = QVBoxLayout(self)
-        _t_lbl = QLabel("补录＝把支付宝里过去的交易抄进来，只影响收益日历，不影响当前持仓。份额必填（照抄支付宝「确认份额」），金额选填。")
+        _t_lbl = QLabel("补录＝把支付宝里过去的交易抄进来，只影响收益日历，不影响当前持仓。选中表格中的一行可编辑；份额必填，金额选填。")
         _t_lbl.setStyleSheet(f"color:{T()['text_sub']};"); root.addWidget(_t_lbl)
 
         self.tbl = QTableWidget(0, 6)
@@ -2694,13 +2842,15 @@ class TradesDialog(QDialog):
         self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.tbl.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.tbl.setStyleSheet(table_qss())
+        self.tbl.itemSelectionChanged.connect(self._load_selected)
         root.addWidget(self.tbl, 1)
 
         form = QFormLayout()
         self.d_date = QDateEdit(QDate.currentDate())
         self.d_date.setCalendarPopup(True); self.d_date.setDisplayFormat("yyyy-MM-dd")
-        self.d_date.setStyleSheet(input_qss())
+        self.d_date.setStyleSheet(date_edit_qss())
         self.d_code = QComboBox()
         for c in sorted(NAME_MAP, key=lambda c: NAME_MAP[c]):
             self.d_code.addItem(f"{NAME_MAP[c]}（{c}）", c)
@@ -2721,17 +2871,19 @@ class TradesDialog(QDialog):
         root.addLayout(form)
 
         bar = QHBoxLayout()
-        b_add = QPushButton("补录一笔"); b_del = QPushButton("删除选中行")
-        b_add.setStyleSheet(soft_btn_qss()); b_del.setStyleSheet(danger_btn_qss())
-        b_add.clicked.connect(self._add); b_del.clicked.connect(self._del)
-        bar.addWidget(b_add); bar.addWidget(b_del); bar.addStretch()
+        self.b_save = QPushButton("补录一笔"); self.b_cancel_edit = QPushButton("取消编辑"); b_del = QPushButton("删除选中行")
+        self.b_save.setStyleSheet(soft_btn_qss()); self.b_cancel_edit.setStyleSheet(ghost_btn_qss()); b_del.setStyleSheet(danger_btn_qss())
+        self.b_save.clicked.connect(self._save); self.b_cancel_edit.clicked.connect(self._cancel_edit); b_del.clicked.connect(self._del)
+        self.b_cancel_edit.hide(); bar.addWidget(self.b_save); bar.addWidget(self.b_cancel_edit); bar.addWidget(b_del); bar.addStretch()
         root.addLayout(bar)
+        self._edit_source_index = None
         self._reload()
 
     def _reload(self):
-        ts = sorted(load_trades(), key=lambda t: t.get("date", ""))
-        self.tbl.setRowCount(len(ts))
-        for r, t in enumerate(ts):
+        all_trades = load_trades()
+        self._rows = sorted(enumerate(all_trades), key=lambda pair: (pair[1].get("date", ""), pair[0]))
+        self.tbl.blockSignals(True); self.tbl.setRowCount(len(self._rows))
+        for r, (_, t) in enumerate(self._rows):
             side_txt = dict(self.SIDES).get(t.get("side"), t.get("side", ""))
             if t.get("note") == "转换": side_txt = "转换·" + side_txt
             vals = [t.get("date", ""),
@@ -2742,29 +2894,75 @@ class TradesDialog(QDialog):
                     t.get("account") or DEFAULT_ACCOUNT]
             for c, v in enumerate(vals):
                 self.tbl.setItem(r, c, QTableWidgetItem(v))
+        self.tbl.clearSelection(); self.tbl.blockSignals(False)
 
-    def _add(self):
+    def _form_record(self, base=None):
         code = self.d_code.currentData(); side = self.d_side.currentData()
         date = self.d_date.date().toString("yyyy-MM-dd")
         shs = self.d_shares.text().strip(); amt = self.d_amount.text().strip()
         if side != "dividend_cash" and not shs:
-            QMessageBox.warning(self, "提示", "请先填份额（现金分红除外）。"); return
-        rec = {"date": date, "code": code, "side": side, "account": self.d_account.currentText() or DEFAULT_ACCOUNT}
-        if shs: rec["shares"] = float(shs)
-        if amt: rec["amount"] = round(float(amt), 2)
-        all_t = load_trades(); all_t.append(rec); save_trades(all_t)
+            QMessageBox.warning(self, "提示", "请先填份额（现金分红除外）。"); return None
+        try:
+            shares = float(shs) if shs else None; amount = round(float(amt), 2) if amt else None
+        except ValueError:
+            QMessageBox.warning(self, "提示", "份额和金额必须是数字。"); return None
+        rec = dict(base or {})
+        rec.update({"date": date, "code": code, "side": side, "account": self.d_account.currentText() or DEFAULT_ACCOUNT})
+        if shares is None: rec.pop("shares", None)
+        else: rec["shares"] = shares
+        if amount is None: rec.pop("amount", None)
+        else: rec["amount"] = amount
+        return rec
+
+    def _save(self):
+        all_t = load_trades()
+        if self._edit_source_index is None:
+            rec = self._form_record()
+            if rec is None: return
+            all_t.append(rec)
+        else:
+            if not (0 <= self._edit_source_index < len(all_t)):
+                QMessageBox.warning(self, "编辑失败", "原记录已变化，请重新选择。"); self._cancel_edit(); return
+            rec = self._form_record(all_t[self._edit_source_index])
+            if rec is None: return
+            all_t[self._edit_source_index] = rec
+        save_trades(all_t)
         self.d_shares.clear(); self.d_amount.clear()
-        self._reload()
+        self._edit_source_index = None; self.b_save.setText("补录一笔"); self.b_cancel_edit.hide(); self._reload()
+
+    def _load_selected(self):
+        row = self.tbl.currentRow()
+        if row < 0 or row >= len(getattr(self, "_rows", [])): return
+        source_index, trade = self._rows[row]; self._edit_source_index = source_index
+        date = QDate.fromString(str(trade.get("date", "")), "yyyy-MM-dd")
+        if date.isValid(): self.d_date.setDate(date)
+        code = str(trade.get("code", "")); ci = self.d_code.findData(code)
+        if ci < 0:
+            self.d_code.addItem(f"{trade.get('name') or code}（{code}）", code); ci = self.d_code.count() - 1
+        self.d_code.setCurrentIndex(ci)
+        si = self.d_side.findData(trade.get("side"));
+        if si >= 0: self.d_side.setCurrentIndex(si)
+        account = trade.get("account") or DEFAULT_ACCOUNT; ai = self.d_account.findText(account)
+        if ai < 0: self.d_account.addItem(account); ai = self.d_account.count() - 1
+        self.d_account.setCurrentIndex(ai)
+        self.d_shares.setText(str(trade.get("shares", "")) if trade.get("shares") is not None else "")
+        self.d_amount.setText(str(trade.get("amount", "")) if trade.get("amount") is not None else "")
+        self.b_save.setText("保存修改"); self.b_cancel_edit.show()
+
+    def _cancel_edit(self):
+        self._edit_source_index = None; self.tbl.clearSelection(); self.d_shares.clear(); self.d_amount.clear()
+        self.b_save.setText("补录一笔"); self.b_cancel_edit.hide()
 
     def _del(self):
         r = self.tbl.currentRow()
         if r < 0: return
-        ts = sorted(load_trades(), key=lambda t: t.get("date", ""))
-        t = ts[r]
+        if r >= len(getattr(self, "_rows", [])): return
+        source_index, t = self._rows[r]
         name = NAME_MAP.get(t.get("code", ""), t.get("code", ""))
         if QMessageBox.question(self, "删除", f"删除 {t.get('date')} {name} 的这笔记录？") == QMessageBox.Yes:
-            all_t = load_trades(); all_t.remove(t); save_trades(all_t)
-            self._reload()
+            all_t = load_trades()
+            if 0 <= source_index < len(all_t): del all_t[source_index]
+            save_trades(all_t); self._cancel_edit(); self._reload()
 
 
 # ---------- 导出 Excel ----------
@@ -2954,6 +3152,87 @@ class ExportDialog(QDialog):
             self._b_export.setEnabled(True)
 
 
+class BackupCenterDialog(QDialog):
+    """v2.4 数据安全中心：创建备份，或校验、预览并恢复备份。"""
+    def __init__(self, parent=None):
+        super().__init__(parent); self.setWindowTitle("备份与恢复"); self.resize(620, 460)
+        self._parent = parent; self._inspected = None
+        lay = QVBoxLayout(self); lay.setSpacing(12)
+        title = QLabel("数据安全中心"); title.setFont(QFont(FONT, 15, QFont.Bold)); lay.addWidget(title)
+        desc = QLabel("备份会打包全部本地账本数据；恢复前先校验并预览，确认后自动保存当前数据快照。恢复失败会回滚。")
+        desc.setWordWrap(True); desc.setStyleSheet(f"color:{T()['text_sub']};"); lay.addWidget(desc)
+
+        backup_box = QFrame(); backup_box.setStyleSheet(board_qss())
+        bl = QHBoxLayout(backup_box); bl.setContentsMargins(14, 12, 14, 12)
+        bt = QVBoxLayout(); bname = QLabel("创建备份"); bname.setFont(QFont(FONT, 11, QFont.Bold))
+        bhint = QLabel("包含基金列表、持仓、交易、显示状态、账户与设置"); bhint.setStyleSheet(f"color:{T()['muted']};")
+        bt.addWidget(bname); bt.addWidget(bhint); bl.addLayout(bt, 1)
+        b_create = QPushButton("立即备份"); b_create.setStyleSheet(soft_btn_qss()); b_create.clicked.connect(self._create_backup)
+        bl.addWidget(b_create); lay.addWidget(backup_box)
+
+        restore_box = QFrame(); restore_box.setStyleSheet(board_qss())
+        rl = QVBoxLayout(restore_box); rl.setContentsMargins(14, 12, 14, 12); rl.setSpacing(8)
+        rtop = QHBoxLayout(); rname = QLabel("从备份恢复"); rname.setFont(QFont(FONT, 11, QFont.Bold)); rtop.addWidget(rname); rtop.addStretch()
+        b_choose = QPushButton("选择备份…"); b_choose.setStyleSheet(ghost_btn_qss()); b_choose.clicked.connect(self._choose_backup)
+        rtop.addWidget(b_choose); rl.addLayout(rtop)
+        self.lbl_path = QLabel("尚未选择备份"); self.lbl_path.setStyleSheet(f"color:{T()['muted']};"); self.lbl_path.setWordWrap(True); rl.addWidget(self.lbl_path)
+        self.preview = QTextEdit(); self.preview.setReadOnly(True); self.preview.setMinimumHeight(150)
+        self.preview.setPlainText("选择 zip 后，这里会显示文件清单、记录数量和校验结果。"); rl.addWidget(self.preview)
+        self.b_restore = QPushButton("恢复这些数据"); self.b_restore.setEnabled(False); self.b_restore.setStyleSheet(danger_btn_qss())
+        self.b_restore.clicked.connect(self._restore); rl.addWidget(self.b_restore, 0, Qt.AlignRight)
+        lay.addWidget(restore_box, 1)
+        close = QPushButton("关闭"); close.clicked.connect(self.accept); close.setStyleSheet(ghost_btn_qss()); lay.addWidget(close, 0, Qt.AlignRight)
+
+    @staticmethod
+    def _record_count(name, data):
+        if name == os.path.basename(HOLD_FILE) and isinstance(data, dict):
+            if any(re.fullmatch(r"\d{6}", str(key)) for key in data): return len(data)
+            return sum(len(value) for value in data.values() if isinstance(value, dict))
+        return len(data) if isinstance(data, (list, dict)) else 0
+
+    def _choose_backup(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择基金日报备份", "", "ZIP 压缩包 (*.zip)")
+        if not path: return
+        self._inspected = inspect_data_backup(path); self.lbl_path.setText(path)
+        manifest = self._inspected.get("manifest") or {}
+        lines = [f"格式：{'v' + str(manifest.get('schema_version')) if manifest else '旧版（兼容）'}"]
+        for name, data in self._inspected.get("files", {}).items():
+            lines.append(f"✓ {name}：{self._record_count(name, data)} 条")
+        lines.extend(f"提示：{msg}" for msg in self._inspected.get("warnings", []))
+        lines.extend(f"错误：{msg}" for msg in self._inspected.get("errors", []))
+        self.preview.setPlainText("\n".join(lines)); self.b_restore.setEnabled(bool(self._inspected.get("ok")))
+
+    def _create_backup(self):
+        ensure_data_manifest()
+        if not any(os.path.exists(path) for path in _data_paths().values()):
+            QMessageBox.information(self, "备份", "还没有任何数据文件，无需备份。"); return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S"); settings = load_settings(); backup_dir = settings.get("backup_dir", "")
+        default = os.path.join(backup_dir if os.path.isdir(backup_dir) else _BASE, f"基金日报备份_{ts}.zip")
+        path, _ = QFileDialog.getSaveFileName(self, "选择备份保存位置", default, "ZIP 压缩包 (*.zip)")
+        if not path: return
+        if not path.lower().endswith(".zip"): path += ".zip"
+        try: create_data_backup(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "备份失败", f"写入失败：{exc}"); return
+        if QMessageBox.question(self, "备份成功", f"已备份到：\n{path}\n\n是否把这个文件夹设为默认备份位置？") == QMessageBox.Yes:
+            settings["backup_dir"] = os.path.dirname(path); save_settings(settings)
+
+    def _restore(self):
+        if not self._inspected or not self._inspected.get("ok"): return
+        names = "、".join(self._inspected["files"].keys())
+        answer = QMessageBox.warning(self, "确认恢复", f"将用备份覆盖以下本地数据：\n{names}\n\n覆盖前会自动保存当前数据快照。恢复完成后程序会刷新。是否继续？",
+                                     QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if answer != QMessageBox.Yes: return
+        snapshot_dir = os.path.join(_BASE, "恢复前快照"); os.makedirs(snapshot_dir, exist_ok=True)
+        snapshot = os.path.join(snapshot_dir, f"恢复前快照_{datetime.now():%Y%m%d_%H%M%S}.zip")
+        try: result = restore_data_backup(self._inspected, snapshot)
+        except Exception as exc:
+            QMessageBox.critical(self, "恢复失败", f"数据未恢复。已尝试自动回滚。\n\n{exc}"); return
+        QMessageBox.information(self, "恢复完成", f"已恢复 {len(result['restored'])} 个数据文件。\n恢复前快照：\n{snapshot}")
+        self.accept()
+        if self._parent is not None: self._parent._reload_after_restore()
+
+
 class SettingsDialog(QDialog):
     """v1.7：设置对话框（外观组：主题切换）。完整分组设置中心见 3.0.0。"""
     def __init__(self, parent=None):
@@ -2979,6 +3258,7 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__(); self.setWindowTitle("基金日报"); self.resize(1320,900)
+        ensure_data_manifest()
         s = QApplication.primaryScreen().geometry(); self.move(max(0,(s.width()-1320)//2),max(0,(s.height()-900)//2))
         pg.setConfigOptions(antialias=True)
         set_theme((load_settings() or {}).get("theme", "b_dark"))  # v2.0.0：默认主题=深空暗（FD-HIG 定案），老用户设置优先
@@ -3050,7 +3330,7 @@ class MainWindow(QMainWindow):
         top.addStretch()
         # 工具群：纯图标小按钮归组最右（悬停显名）
         self._tb_tools = []
-        for _k, _tip, _slot in (("export","导出",self._open_export),("backup","备份",self._open_backup),
+        for _k, _tip, _slot in (("export","导出",self._open_export),("backup","备份与恢复",self._open_backup),
                                 ("about","关于",self._open_about),("settings","设置",self._open_settings)):
             _b = QPushButton(QIcon(icon_pixmap(_k, t["muted"], 15)), "")
             _b.setFixedSize(30,30); _b.setToolTip(_tip); _b.clicked.connect(_slot)
@@ -3076,7 +3356,7 @@ class MainWindow(QMainWindow):
         self.lbl_noacc = QLabel("")  # v1.2：无持仓账户引导
         self.lbl_noacc.setStyleSheet(f"QLabel{{color:{t['accent']};background:{t['accent_soft']};border:1px solid {t['accent_soft_hover']};border-radius:8px;padding:8px 12px;font-size:12px;}}")
         self.lbl_noacc.setWordWrap(True); self.lbl_noacc.hide(); outer.addWidget(self.lbl_noacc)
-        self.lbl_empty = QLabel("看板还是空的：在左上方『快速添加』输入 6 位基金代码，添加第一只基金后，这里就会变成你的持仓看板。")
+        self.lbl_empty = QLabel("看板还是空的：在左上方『快速添加』输入基金代码或名称，添加第一只基金后，这里就会变成你的持仓看板。")
         self.lbl_empty.setStyleSheet(f"QLabel{{color:{t['accent']};background:{t['accent_soft']};border:1px solid {t['accent_soft_hover']};border-radius:10px;padding:14px 16px;font-size:12px;}}")
         self.lbl_empty.setWordWrap(True); outer.addWidget(self.lbl_empty)
         split = QSplitter(Qt.Horizontal)
@@ -3090,18 +3370,17 @@ class MainWindow(QMainWindow):
         abl = QHBoxLayout(add_box); abl.setContentsMargins(12,10,12,10)
         atitle = QLabel("快速添加"); atitle.setFont(QFont(FONT,9,QFont.Bold)); atitle.setStyleSheet(f"color:{t['text']};"); abl.addWidget(atitle)
         self._add_title = atitle
-        self._add_input = QLineEdit(); self._add_input.setPlaceholderText("6位代码，或点「搜名字」"); self._add_input.setFont(QFont(FONT,9))
-        self._add_input.setFixedWidth(150); self._add_input.setStyleSheet(f"QLineEdit{{padding:6px 8px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}")
+        self._add_input = QLineEdit(); self._add_input.setPlaceholderText("输入 6 位代码或基金名称"); self._add_input.setFont(QFont(FONT,9))
+        self._add_input.setFixedWidth(220); self._add_input.setStyleSheet(input_qss(t))
         abl.addWidget(self._add_input)
-        self._search_btn = QPushButton("搜名字"); self._search_btn.setFont(QFont(FONT,9))
-        self._search_btn.setStyleSheet(soft_btn_qss(t))
-        self._search_btn.clicked.connect(self._search_pick); abl.addWidget(self._search_btn)
         self._add_btn = QPushButton("添加"); self._add_btn.setFont(QFont(FONT,9))
         self._add_btn.setStyleSheet(soft_btn_qss(t))
-        self._add_btn.clicked.connect(self._add_fund); abl.addWidget(self._add_btn)
-        self._rm_btn = QPushButton("移除自加"); self._rm_btn.setFont(QFont(FONT,9))
-        self._rm_btn.setStyleSheet(f"QPushButton{{padding:6px 12px;border-radius:6px;background:transparent;color:{t['up']};border:1px solid {t['card_border']};}}QPushButton:hover{{background:{t['hover_bg']};}}")
-        self._rm_btn.clicked.connect(self._remove_custom_fund); abl.addWidget(self._rm_btn)
+        self._add_btn.clicked.connect(self._add_or_search); abl.addWidget(self._add_btn)
+        self._add_input.returnPressed.connect(self._add_or_search)
+        self._fund_menu_btn = QPushButton("⋯"); self._fund_menu_btn.setFixedSize(32, 32)
+        self._fund_menu_btn.setToolTip("管理看板基金")
+        self._fund_menu_btn.setStyleSheet(ghost_btn_qss(t, pad="0px"))
+        self._fund_menu_btn.clicked.connect(self._show_fund_menu); abl.addWidget(self._fund_menu_btn)
         abl.addStretch()
         left_col.addWidget(add_box)
         chart_box = QFrame(); chart_box.setStyleSheet(board_qss())
@@ -3204,9 +3483,8 @@ class MainWindow(QMainWindow):
             self.lbl_alert.setStyleSheet(f"QLabel{{color:{t['up']};background:{t['hover_bg']};border:1px solid {t['card_border']};border-radius:8px;padding:8px 12px;}}")
             _info = f"QLabel{{color:{t['accent']};background:{t['accent_soft']};border:1px solid {t['accent_soft_hover']};border-radius:8px;padding:8px 12px;font-size:12px;}}"
             self.lbl_noacc.setStyleSheet(_info); self.lbl_empty.setStyleSheet(_info.replace("8px;", "10px;").replace("padding:8px 12px", "padding:14px 16px"))
-            self._add_input.setStyleSheet(f"QLineEdit{{padding:6px 8px;border:1px solid {t['card_border']};border-radius:6px;background:{t['card_bg']};color:{t['text']};}}")
-            self._search_btn.setStyleSheet(soft_btn_qss(t)); self._add_btn.setStyleSheet(soft_btn_qss(t))
-            self._rm_btn.setStyleSheet(f"QPushButton{{padding:6px 12px;border-radius:6px;background:transparent;color:{t['up']};border:1px solid {t['card_border']};}}QPushButton:hover{{background:{t['hover_bg']};}}")
+            self._add_input.setStyleSheet(input_qss(t)); self._add_btn.setStyleSheet(soft_btn_qss(t))
+            self._fund_menu_btn.setStyleSheet(ghost_btn_qss(t, pad="0px"))
             if hasattr(self, "_sort_combo"):
                 self._sort_combo.setStyleSheet(combo_qss(t))
         if hasattr(self, "summary"): self.summary.setStyleSheet(panel_qss())
@@ -3475,53 +3753,26 @@ class MainWindow(QMainWindow):
         ExportDialog(self).exec()
 
     def _open_backup(self):
-        """一键备份：把 5 个数据 json 打包成 zip。支持记住默认目录。"""
-        files = [EXTRA_FILE, HOLD_FILE, TRADES_FILE, SHOW_FILE, ACCOUNTS_FILE, SETTINGS_FILE]
-        existing = [f for f in files if os.path.exists(f)]
-        if not existing:
-            QMessageBox.information(self, "备份", "还没有任何数据文件，无需备份。")
-            return
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_name = f"基金日报备份_{ts}.zip"
-        settings = load_settings()
-        backup_dir = settings.get("backup_dir", "")
-        used_default = False
-        if backup_dir and os.path.isdir(backup_dir):
-            save_path = os.path.join(backup_dir, default_name)
-            used_default = True
-        else:
-            save_path, _ = QFileDialog.getSaveFileName(self, "选择备份保存位置", default_name, "ZIP 压缩包 (*.zip)")
-            if not save_path:
-                return
-        try:
-            with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for f in existing:
-                    zf.write(f, os.path.basename(f))
-        except Exception as e:
-            QMessageBox.warning(self, "备份失败", f"写入失败：{e}")
-            return
-        if used_default:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("备份成功")
-            msg.setIcon(QMessageBox.Information)
-            msg.setText(f"✅ 已备份到：\n{save_path}\n\n（已存到你设置的默认目录）")
-            b_change = msg.addButton("更换默认目录", QMessageBox.ActionRole)
-            msg.addButton("好的", QMessageBox.AcceptRole)
-            msg.exec()
-            if msg.clickedButton() is b_change:
-                new_dir = QFileDialog.getExistingDirectory(self, "选择新的默认备份目录", backup_dir)
-                if new_dir:
-                    settings["backup_dir"] = new_dir; save_settings(settings)
-        else:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("备份成功")
-            msg.setIcon(QMessageBox.Information)
-            msg.setText(f"✅ 已备份到：\n{save_path}")
-            b_remember = msg.addButton("记住这个位置", QMessageBox.ActionRole)
-            msg.addButton("就这一次", QMessageBox.AcceptRole)
-            msg.exec()
-            if msg.clickedButton() is b_remember:
-                settings["backup_dir"] = os.path.dirname(save_path); save_settings(settings)
+        BackupCenterDialog(self).exec()
+
+    def _reload_after_restore(self):
+        """Reload runtime collections after a successful restore."""
+        global FUNDS, NAME_MAP
+        FUNDS = [(item["code"], item["name"]) for item in _load_extra()]
+        NAME_MAP = dict(FUNDS)
+        restored_theme = (load_settings() or {}).get("theme", _THEME)
+        if restored_theme in THEMES: set_theme(restored_theme)
+        self._refresh_account_combo()
+        self._cleared_codes = load_show_state()
+        for card in list(self.cards.values()):
+            self.cards_layout.removeWidget(card); card.deleteLater()
+        self.cards.clear(); self.last_results = []; self.resolved = {}; self.corrected_codes = set()
+        for code, name in FUNDS:
+            card = FundCard(code); card.lbl_name.setText(name)
+            card.btn_detail.clicked.connect(lambda checked, cd=code: self._open_detail(cd))
+            card.btn_clear.clicked.connect(lambda checked, cd=code: self._toggle_cleared(cd))
+            self.cards_layout.insertWidget(self.cards_layout.count() - 1, card); self.cards[code] = card
+        self._sync_empty_banner(); self._restyle_all(); self._refresh_home()
 
     def _open_about(self):
         """v1.0.0 新增：关于本软件（版本信息 / GitHub 链接 / 隐私声明 / 免责声明 / 手动检查更新）。"""
@@ -3627,6 +3878,8 @@ class MainWindow(QMainWindow):
             d._worker = w  # 防 worker 被提前回收
             w.start()
         b_go.clicked.connect(do_search)
+        if ed.text().strip():
+            QTimer.singleShot(0, do_search)
         def pick(item, *_):
             txt = item.text()
             m = re.search(r"（(\d{6})）", txt)
@@ -3637,6 +3890,22 @@ class MainWindow(QMainWindow):
         d.exec()
         if d.result() == QDialog.Accepted:
             self._add_fund()
+
+    def _add_or_search(self):
+        """统一快速添加入口：代码直接识别，名称进入搜索选择。"""
+        key = self._add_input.text().strip()
+        if not key:
+            self._add_input.setFocus(); return
+        if re.fullmatch(r"\d{6}", key):
+            self._add_fund()
+        else:
+            self._search_pick()
+
+    def _show_fund_menu(self):
+        menu = QMenu(self)
+        manage = menu.addAction("管理看板基金")
+        manage.triggered.connect(self._remove_custom_fund)
+        menu.exec(self._fund_menu_btn.mapToGlobal(self._fund_menu_btn.rect().bottomLeft()))
 
     def _add_fund(self):
         code = self._add_input.text().strip()
