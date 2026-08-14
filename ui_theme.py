@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Theme tokens and Qt rendering helpers."""
 
+import math
 import os
 import tempfile
 
@@ -265,9 +266,78 @@ def icon_pixmap(kind, color, size=24, stroke=1.6):
     elif kind == "diag":
         painter.drawPath(line_path((3, 12.5), (7, 12.5), (9.4, 7), (12.6, 17), (15, 12.5), (21, 12.5)))
     elif kind == "settings":
-        painter.drawLine(point(4, 8), point(20, 8))
-        painter.drawEllipse(point(9.5, 8), 2 * scale, 2 * scale)
-        painter.drawLine(point(4, 16), point(20, 16))
-        painter.drawEllipse(point(14.5, 16), 2 * scale, 2 * scale)
+        painter.save(); painter.translate(12 * scale, 12 * scale)
+        for tooth_angle in range(0, 360, 45):
+            painter.save(); painter.rotate(tooth_angle)
+            painter.drawRoundedRect(QRectF(-1.45 * scale, -10 * scale, 2.9 * scale, 4.1 * scale), .7 * scale, .7 * scale)
+            painter.restore()
+        painter.drawEllipse(QRectF(-6.8 * scale, -6.8 * scale, 13.6 * scale, 13.6 * scale))
+        painter.drawEllipse(QRectF(-1.9 * scale, -1.9 * scale, 3.8 * scale, 3.8 * scale)); painter.restore()
+    painter.end()
+    return pixmap
+
+
+def nav_icon_pixmap(kind, color, size=24, phase=0.0, angle=0.0, stroke=1.6):
+    """侧栏语义动效图标：外框稳定，仅动画化各图标表达含义的内部部件。"""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    scale = size / 24.0
+    pen = QPen(QColor(color)); pen.setWidthF(stroke); pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen); painter.setBrush(Qt.NoBrush)
+
+    def point(x, y):
+        return QPointF(x * scale, y * scale)
+
+    def line_path(*points):
+        path = QPainterPath(point(*points[0]))
+        for item in points[1:]: path.lineTo(point(*item))
+        return path
+
+    pulse = math.sin(math.pi * max(0.0, min(1.0, float(phase))))
+    if kind == "logo":
+        painter.drawRoundedRect(QRectF(2.5 * scale, 2.5 * scale, 19 * scale, 19 * scale), 5 * scale, 5 * scale)
+        painter.drawPath(line_path((6.8, 15.6), (10.2, 11.5), (13.1, 14.0), (17.0, 8.8)))
+        # 静止终点始终保留；半透明信号点沿曲线前进，首尾帧完全一致且无重置跳变。
+        painter.setPen(Qt.NoPen); painter.setBrush(QColor(color))
+        painter.drawEllipse(point(17.0, 8.8), 1.25 * scale, 1.25 * scale)
+        anchors = ((6.8, 15.6), (10.2, 11.5), (13.1, 14.0), (17.0, 8.8))
+        progress = max(0.0, min(1.0, float(phase)))
+        section = min(len(anchors) - 2, int(progress * (len(anchors) - 1)))
+        local = progress * (len(anchors) - 1) - section
+        x0, y0 = anchors[section]; x1, y1 = anchors[section + 1]
+        x, y = x0 + (x1 - x0) * local, y0 + (y1 - y0) * local
+        moving = QColor(color); moving.setAlphaF(max(0.0, pulse))
+        painter.setBrush(moving)
+        if pulse > 0.001: painter.drawEllipse(point(x, y), 1.55 * scale, 1.55 * scale)
+    elif kind == "trades":
+        painter.drawRoundedRect(QRectF(5 * scale, 3.5 * scale, 14 * scale, 17 * scale), 2 * scale, 2 * scale)
+        # 三条内容依次轻抬再落回；phase 0/1 都是完整静止凭据，不发生瞬间重置。
+        for index, (y, width) in enumerate(((8.2, 16), (12, 16), (15.8, 12.5))):
+            local = max(0.0, min(1.0, (float(phase) - index * .18) / .56))
+            offset = -2.7 * math.sin(math.pi * local)
+            painter.drawLine(point(8, y + offset), point(width, y + offset))
+    elif kind == "pnl":
+        painter.drawLine(point(4.5, 19), point(19.5, 19))
+        # 三根柱依次脉冲后回到原高度；首尾帧一致，基线始终固定。
+        for index, (x, top) in enumerate(((8, 12.5), (12, 7.5), (16, 14.5))):
+            height = 19 - top
+            local = max(0.0, min(1.0, (float(phase) - index * .16) / .58))
+            factor = 1.0 + .24 * math.sin(math.pi * local)
+            animated_top = 19 - height * factor
+            painter.drawLine(point(x, 19), point(x, animated_top))
+    elif kind == "settings":
+        painter.translate(12 * scale, 12 * scale); painter.rotate(float(angle)); painter.translate(-12 * scale, -12 * scale)
+        painter.save(); painter.translate(12 * scale, 12 * scale)
+        for tooth_angle in range(0, 360, 45):
+            painter.save(); painter.rotate(tooth_angle)
+            painter.drawRoundedRect(QRectF(-1.45 * scale, -10 * scale, 2.9 * scale, 4.1 * scale), .7 * scale, .7 * scale)
+            painter.restore()
+        painter.drawEllipse(QRectF(-6.8 * scale, -6.8 * scale, 13.6 * scale, 13.6 * scale))
+        painter.drawEllipse(QRectF(-1.9 * scale, -1.9 * scale, 3.8 * scale, 3.8 * scale)); painter.restore()
+    else:
+        painter.end()
+        return icon_pixmap(kind, color, size, stroke)
     painter.end()
     return pixmap

@@ -23,9 +23,9 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, QTimer, QPropertyAnimation, QAbstractAnimation, QDate,
-    QPointF,
+    QPoint, QPointF, QSize, QEasingCurve, Property,
 )
-from PySide6.QtGui import QFont, QColor, QCursor, QPainter, QPen, QPainterPath, QIcon
+from PySide6.QtGui import QFont, QColor, QCursor, QPainter, QPen, QPainterPath, QIcon, QPixmap
 import pyqtgraph as pg
 
 import data_sources as market_data
@@ -87,7 +87,8 @@ SETTINGS_FILE = "settings.json"  # v0.7 用户设置（默认备份目录等）
 DATA_VERSION_FILE = "数据版本.json"  # v2.4：独立 schema 清单，不改六类既有 JSON 顶层结构
 DATA_SCHEMA_VERSION = 1
 DEFAULT_ACCOUNT = "默认"
-APP_VERSION = "2.5.0"
+APP_VERSION = "3.0.0"
+BUILD_CHANNEL_LABEL = "正式发布"
 GITHUB_REPO = "GoldenMoon-cell/fund-daily-report"
 RED, GREEN, GRAY = "#e53935", "#16a34a", "#888888"
 TEAL = "#0891b2"
@@ -161,6 +162,9 @@ def icon_pixmap(kind, color, size=24, stroke=1.6):
     """v2.0.0：原创手绘图标（QPainter 直画，无 emoji 无图标库）。
        FD-HIG 图标规范：24 网格 / 1.5~1.6 线宽 / 圆帽圆角连接 / 单色。"""
     return theme_ui.icon_pixmap(kind, color, size, stroke)
+def nav_icon_pixmap(kind, color, size=24, phase=0.0, angle=0.0, stroke=1.6):
+    """v3.0：侧栏图标按语义分别绘制动效帧。"""
+    return theme_ui.nav_icon_pixmap(kind, color, size, phase, angle, stroke)
 IMP = QColor("#ffe0b2")
 REPAIR_THRESHOLD = 0.5
 CMP_INDEX = [("1.000300", "沪深300"), ("1.000905", "中证500"), ("1.000016", "上证50"), ("0.399006", "创业板指")]
@@ -3305,9 +3309,9 @@ class BackupCenterDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    """v1.7：设置对话框（外观组：主题切换）。完整分组设置中心见 3.0.0。"""
+    """v3.0：设置对话框（外观与动态效果）。"""
     def __init__(self, parent=None):
-        super().__init__(parent); self.setWindowTitle("设置"); self.resize(470, 210)
+        super().__init__(parent); self.setWindowTitle("设置"); self.resize(470, 240)
         lay = QVBoxLayout(self); lay.setContentsMargins(16,14,16,14); lay.setSpacing(10)
         grp = QLabel("外观"); grp.setFont(QFont(FONT, 11, QFont.Bold)); lay.addWidget(grp)
         row = QHBoxLayout()
@@ -3317,13 +3321,85 @@ class SettingsDialog(QDialog):
         ix = self.combo.findData(_THEME)
         if ix >= 0: self.combo.setCurrentIndex(ix)
         row.addWidget(self.combo, 1); lay.addLayout(row)
-        hint = QLabel("主题切换立即生效并记住。四套主题均已全屏适配（顶栏/卡片/榜单/详情页/弹窗）。")
+        self.reduce_motion = QCheckBox("减少动态效果")
+        self.reduce_motion.setChecked(bool((load_settings() or {}).get("reduce_motion", False)))
+        lay.addWidget(self.reduce_motion)
+        hint = QLabel("主题切换立即生效并记住。勾选“减少动态效果”后，页面切换与基金卡片刷新均不使用动画。")
         hint.setFont(QFont(FONT, 8)); hint.setStyleSheet(f"color:{T()['muted']};"); hint.setWordWrap(True); lay.addWidget(hint)
         lay.addStretch()
         brow = QHBoxLayout(); brow.addStretch()
         ok = QPushButton("确定"); ok.clicked.connect(self.accept)
         canc = QPushButton("取消"); canc.clicked.connect(self.reject)
         brow.addWidget(ok); brow.addWidget(canc); lay.addLayout(brow)
+
+
+class AnimatedNavButton(QPushButton):
+    """侧栏导航按钮：按图标语义驱动内部部件，不套用统一旋转模板。"""
+    def __init__(self, kind, text, parent=None):
+        super().__init__(text, parent)
+        self._kind = kind; self._angle = 0.0; self._effect_progress = 0.0; self._icon_color = T()["muted"]
+        self._icon_animation = None
+        self.setIconSize(QSize(24, 24)); self._render_icon()
+        self.pressed.connect(self._animate_press); self.released.connect(self._animate_release)
+
+    def _motion_reduced(self):
+        return bool((load_settings() or {}).get("reduce_motion", False))
+
+    def set_nav_color(self, color):
+        self._icon_color = color; self._render_icon()
+
+    def _render_icon(self):
+        self.setIcon(QIcon(nav_icon_pixmap(self._kind, self._icon_color, 24,
+                                           self._effect_progress, self._angle)))
+
+    def _set_icon_angle(self, value):
+        self._angle = float(value); self._render_icon()
+
+    iconAngle = Property(float, lambda self: self._angle, _set_icon_angle)
+
+    def _set_effect_progress(self, value):
+        self._effect_progress = float(value); self._render_icon()
+
+    effectProgress = Property(float, lambda self: self._effect_progress, _set_effect_progress)
+
+    def _run_icon_animation(self, property_name, end, duration, easing):
+        self._stop_icon_animation()
+        animation = QPropertyAnimation(self, property_name, self)
+        start = self._angle if property_name == b"iconAngle" else self._effect_progress
+        animation.setDuration(duration); animation.setStartValue(start); animation.setEndValue(end)
+        animation.setEasingCurve(easing)
+        animation.finished.connect(lambda a=animation: self._finish_icon_animation(a))
+        self._icon_animation = animation; animation.start()
+
+    def _stop_icon_animation(self):
+        if self._icon_animation is None: return
+        self._icon_animation.stop(); self._icon_animation.deleteLater(); self._icon_animation = None
+
+    def _finish_icon_animation(self, animation):
+        if self._kind == "settings": self._set_icon_angle(0.0)
+        else: self._set_effect_progress(0.0)
+        if self._icon_animation is animation: self._icon_animation = None
+        animation.deleteLater()
+
+    def _reset_icon_motion(self):
+        self._stop_icon_animation(); self._set_icon_angle(0.0); self._set_effect_progress(0.0)
+
+    def _animate_press(self):
+        if self._motion_reduced(): self._reset_icon_motion(); return
+        if self._kind == "settings":
+            self._run_icon_animation(b"iconAngle", -8.0, 110, QEasingCurve.OutCubic)
+        else:
+            # 非设置图标按下只走按钮原生 pressed 态；语义动效统一在松开后完整播放一次。
+            self._stop_icon_animation()
+
+    def _animate_release(self):
+        if self._motion_reduced(): self._reset_icon_motion(); return
+        if self._kind == "settings":
+            self._run_icon_animation(b"iconAngle", 360.0, 720, QEasingCurve.InOutCubic)
+        else:
+            self._set_effect_progress(0.0)
+            duration = {"logo": 720, "trades": 760, "pnl": 820}.get(self._kind, 760)
+            self._run_icon_animation(b"effectProgress", 1.0, duration, QEasingCurve.Linear)
 
 
 class MainWindow(QMainWindow):
@@ -3334,19 +3410,255 @@ class MainWindow(QMainWindow):
         pg.setConfigOptions(antialias=True)
         set_theme((load_settings() or {}).get("theme", "b_dark"))  # v2.0.0：默认主题=深空暗（FD-HIG 定案），老用户设置优先
         self._apply_global_qss()
-        root = QWidget(); self.setCentralWidget(root)
-        outer = QVBoxLayout(root); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
-        self.stack = QStackedWidget(); outer.addWidget(self.stack)
-        self.home = self._build_home(); self.detail = DetailPage(on_back=self._go_home)
-        self.stack.addWidget(self.home); self.stack.addWidget(self.detail)
+        root = QWidget(); root.setObjectName("v3ShellRoot"); self._shell_root = root; self.setCentralWidget(root)
+        shell = QHBoxLayout(root); shell.setContentsMargins(0,0,0,0); shell.setSpacing(0)
+        self._sidebar = self._build_sidebar(); shell.addWidget(self._sidebar)
+        self.stack = QStackedWidget(); self.stack.setObjectName("v3PageStack"); shell.addWidget(self.stack, 1)
+        self.home = self._build_home(); self.ledger_page = self._build_ledger_page()
+        self.returns_page = self._build_returns_page(); self.data_page = self._build_data_page()
+        self.detail = DetailPage(on_back=self._go_home)
+        for page in (self.home, self.ledger_page, self.returns_page, self.data_page, self.detail):
+            self.stack.addWidget(page)
+        self._main_pages = {"overview": 0, "ledger": 1, "returns": 2, "data": 3}
+        self._page_key = "overview"; self._page_anim = None
         self.worker = None; self.last_results = []; self.resolved = {}; self.corrected_codes = set()
         self._cleared_codes = load_show_state()
         self._pnl_dialog = None
         self._val_cache = {}   # v1.3 估值红绿灯缓存 {"date": 当日, "pct": {code: 百分位}}
         self._spark_cache = load_spark_cache()  # v2.1.0 迷你走势缓存 {"date": 当日, "data": {code: [净值…]}}
         self._spark_workers = []  # v2.1.0：持有工作线程引用防 GC
+        self._restyle_all()
         self._refresh_home()
         self._check_update()
+
+    def _build_sidebar(self):
+        bar = QFrame(); bar.setObjectName("v3Sidebar"); bar.setFixedWidth(190)
+        lay = QVBoxLayout(bar); lay.setContentsMargins(12,16,12,14); lay.setSpacing(5)
+        t = T()
+        brand = QHBoxLayout(); brand.setSpacing(8)
+        self._logo_lbl = QLabel(); self._logo_lbl.setPixmap(icon_pixmap("logo", t["accent"], 25)); brand.addWidget(self._logo_lbl)
+        title_col = QVBoxLayout(); title_col.setSpacing(0)
+        self._title_lbl = QLabel("基金日报"); self._title_lbl.setFont(QFont(FONT,12,QFont.Bold)); title_col.addWidget(self._title_lbl)
+        self._ver_lbl = QLabel(f"v{APP_VERSION}"); self._ver_lbl.setFont(QFont(FONT,8)); title_col.addWidget(self._ver_lbl)
+        brand.addLayout(title_col, 1); lay.addLayout(brand); lay.addSpacing(12)
+        self._account_combo = QComboBox(); self._account_combo.setFont(QFont(FONT,9))
+        self._account_combo.setStyleSheet(combo_qss(t))
+        self._account_combo.addItem("全部账户", "__all__")
+        for account in load_accounts(): self._account_combo.addItem(account, account)
+        self._account_combo.currentIndexChanged.connect(self._on_account_changed); lay.addWidget(self._account_combo)
+        self._nav_group = QButtonGroup(self); self._nav_group.setExclusive(True); self._nav_buttons = {}
+        for key, text, icon in (("overview","总览","logo"),("ledger","账本","trades"),
+                                ("returns","收益","pnl"),("data","数据与设置","settings")):
+            button = AnimatedNavButton(icon, "  " + text)
+            button.setCheckable(True); button.setFont(QFont(FONT,10)); button.setMinimumHeight(38)
+            button.clicked.connect(lambda _checked=False, page=key: self._switch_page(page))
+            self._nav_group.addButton(button); self._nav_buttons[key] = button; lay.addWidget(button)
+        self._nav_buttons["overview"].setChecked(True)
+        lay.addStretch()
+        self.btn_about = QPushButton(QIcon(icon_pixmap("about", t["muted"], 16)), "  关于")
+        self.btn_about.clicked.connect(self._open_about); lay.addWidget(self.btn_about)
+        return bar
+
+    def _page_shell(self, title, subtitle):
+        page = QWidget(); page.setAttribute(Qt.WA_StyledBackground, True)
+        layout = QVBoxLayout(page); layout.setContentsMargins(26,22,26,22); layout.setSpacing(14)
+        heading = QLabel(title); heading.setFont(QFont(FONT,18,QFont.Bold)); heading.setProperty("v3Heading", True); layout.addWidget(heading)
+        sub = QLabel(subtitle); sub.setProperty("v3Subheading", True); layout.addWidget(sub)
+        return page, layout
+
+    def _action_panel(self, title, description, actions):
+        panel = QFrame(); panel.setProperty("v3Panel", True)
+        layout = QVBoxLayout(panel); layout.setContentsMargins(16,14,16,14); layout.setSpacing(8)
+        heading = QLabel(title); heading.setFont(QFont(FONT,11,QFont.Bold)); layout.addWidget(heading)
+        text = QLabel(description); text.setWordWrap(True); text.setProperty("v3Subheading", True); layout.addWidget(text)
+        row = QHBoxLayout(); row.setSpacing(8)
+        buttons = []
+        for label, icon, slot, primary in actions:
+            button = QPushButton(QIcon(icon_pixmap(icon, "#ffffff" if primary else T()["muted"], 15)), "  " + label)
+            button.clicked.connect(slot); button.setProperty("v3Primary", primary); button.setProperty("v3Icon", icon)
+            button.setStyleSheet(primary_btn_qss() if primary else ghost_btn_qss())
+            row.addWidget(button); buttons.append(button)
+        row.addStretch(); layout.addLayout(row)
+        return panel, buttons
+
+    def _build_ledger_page(self):
+        page, layout = self._page_shell("账本", "持仓、交易流水与账本健康集中在一个工作区。")
+        actions, buttons = self._action_panel("账本操作", "补录或修改数据后，账本健康会按当前账户重新核验。", [
+            ("管理持仓", "hold", self._open_hold, True),
+            ("交易记录", "trades", self._open_trades, False),
+            ("完整健康报告", "diag", self._show_ledger_health, False),
+        ])
+        self.btn_hold, self.btn_trades, self.btn_diag = buttons; layout.addWidget(actions)
+        self._ledger_status = QLabel(""); self._ledger_status.setWordWrap(True); layout.addWidget(self._ledger_status)
+        self._ledger_table = QTableWidget(0, 7)
+        self._ledger_table.setHorizontalHeaderLabels(["基金", "状态", "当前份额", "流水份额", "剩余本金", "已实现+分红", "待处理"])
+        self._ledger_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._ledger_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self._ledger_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self._ledger_table.setStyleSheet(table_qss())
+        layout.addWidget(self._ledger_table, 1)
+        return page
+
+    def _build_returns_page(self):
+        page, layout = self._page_shell("收益", "统一收益、现金分红与收益日历使用同一账户口径。")
+        self._returns_summary = QLabel("尚未刷新行情"); self._returns_summary.setProperty("v3Metric", True); layout.addWidget(self._returns_summary)
+        breakdown = QFrame(); breakdown.setProperty("v3Panel", True)
+        grid = QGridLayout(breakdown); grid.setContentsMargins(16,14,16,14); grid.setHorizontalSpacing(22)
+        self._return_values = {}
+        for column, (key, title) in enumerate((("unrealized", "未实现收益"), ("realized", "已实现收益"),
+                                               ("cash_dividend", "现金分红"), ("invested", "累计投入"))):
+            label = QLabel(title); label.setProperty("v3Subheading", True); grid.addWidget(label, 0, column)
+            value = QLabel("—"); value.setFont(QFont(FONT,13,QFont.Bold)); self._return_values[key] = value
+            grid.addWidget(value, 1, column)
+        layout.addWidget(breakdown)
+        panel, buttons = self._action_panel("收益分析", "收益日历保留现有月度、年度汇总和按账户筛选能力。", [
+            ("打开收益日历", "pnl", self._open_pnl, True),
+            ("账本健康", "diag", lambda: self._switch_page("ledger"), False),
+        ])
+        self.btn_pnl = buttons[0]; layout.addWidget(panel); layout.addStretch()
+        return page
+
+    def _build_data_page(self):
+        page, layout = self._page_shell("数据与设置", "备份、导出、账户与外观设置集中管理。")
+        self._data_status = QLabel(""); self._data_status.setWordWrap(True)
+        self._data_status.setProperty("v3Subheading", True); layout.addWidget(self._data_status)
+        content = QWidget(); content.setMaximumWidth(1060)
+        content_layout = QVBoxLayout(content); content_layout.setContentsMargins(0,4,0,0); content_layout.setSpacing(10)
+        buttons = []
+        groups = [
+            ("数据安全", [
+                ("备份与恢复", "创建、校验和恢复本地数据备份。", "backup", self._open_backup),
+                ("导出 Excel", "导出持仓、交易、收益与行情快照。", "export", self._open_export),
+            ]),
+            ("账户与偏好", [
+                ("账户管理", "管理账户与各账户的持仓数据。", "hold", self._open_hold),
+                ("外观与动态效果", "切换主题，或关闭页面与按钮动画。", "settings", self._open_settings),
+            ]),
+        ]
+        self._data_groups = []
+        for group_title, items in groups:
+            label = QLabel(group_title); label.setFont(QFont(FONT,10,QFont.Bold)); label.setProperty("v3GroupTitle", True)
+            content_layout.addWidget(label)
+            group = QFrame(); group.setProperty("v3SettingsGroup", True); self._data_groups.append(group)
+            group_layout = QVBoxLayout(group); group_layout.setContentsMargins(0,0,0,0); group_layout.setSpacing(0)
+            for index, (title, desc, icon, slot) in enumerate(items):
+                row = QFrame(); row.setProperty("v3SettingRow", True)
+                row_layout = QHBoxLayout(row); row_layout.setContentsMargins(16,13,14,13); row_layout.setSpacing(12)
+                icon_label = QLabel(); icon_label.setFixedSize(34,34); icon_label.setAlignment(Qt.AlignCenter)
+                icon_label.setProperty("v3SettingIcon", icon); row_layout.addWidget(icon_label)
+                copy = QVBoxLayout(); copy.setSpacing(2)
+                heading = QLabel(title); heading.setFont(QFont(FONT,10,QFont.Bold)); heading.setProperty("v3SettingTitle", True)
+                description = QLabel(desc); description.setProperty("v3Subheading", True)
+                copy.addWidget(heading); copy.addWidget(description); row_layout.addLayout(copy, 1)
+                button = QPushButton("打开"); button.setProperty("v3Icon", icon); button.setProperty("v3Primary", False)
+                button.setIcon(QIcon(icon_pixmap(icon, T()["muted"], 15))); button.clicked.connect(slot)
+                button.setMinimumWidth(82); button.setStyleSheet(ghost_btn_qss()); row_layout.addWidget(button)
+                group_layout.addWidget(row); buttons.append(button)
+                if index < len(items) - 1:
+                    separator = QFrame(); separator.setFixedHeight(1); separator.setProperty("v3SettingSeparator", True)
+                    group_layout.addWidget(separator)
+            content_layout.addWidget(group); content_layout.addSpacing(6)
+        self.btn_backup, self.btn_export, self.btn_hold_data, self.btn_settings = buttons
+        layout.addWidget(content); layout.addStretch()
+        return page
+
+    def _switch_page(self, key, animate=True):
+        """v3.0：主题底色上的短距离滑入；全程不改变透明度，避免暗色闪白。"""
+        if key not in self._main_pages: return
+        self._stop_page_animation()
+        index = self._main_pages[key]
+        current = self.stack.currentIndex()
+        reduce_motion = bool((load_settings() or {}).get("reduce_motion", False))
+        use_motion = animate and not reduce_motion and current != index
+        # 目标页在旧页仍可见时完成数据刷新；切换后仅做位置动画，不改变透明度。
+        self.stack.setUpdatesEnabled(False)
+        try:
+            if key == "ledger": self._refresh_ledger_page()
+            elif key == "returns": self._refresh_returns_page()
+            elif key == "data": self._refresh_data_page()
+            self.stack.setCurrentIndex(index); self._page_key = key
+            page = self.stack.currentWidget()
+            page.move(QPoint(22 if index > current else -22, 0) if use_motion else QPoint(0, 0))
+        finally:
+            self.stack.setUpdatesEnabled(True)
+        for name, button in self._nav_buttons.items():
+            selected = name == key
+            button.setChecked(selected)
+            if isinstance(button, AnimatedNavButton):
+                button.set_nav_color(T()["accent"] if selected else T()["muted"])
+        self.stack.update()
+        if use_motion:
+            animation = QPropertyAnimation(page, b"pos", self)
+            animation.setDuration(170)
+            animation.setStartValue(page.pos()); animation.setEndValue(QPoint(0, 0))
+            animation.setEasingCurve(QEasingCurve.OutCubic)
+            animation.finished.connect(lambda a=animation, p=page: self._finish_page_animation(a, p))
+            self._page_anim = animation; animation.start()
+
+    def _stop_page_animation(self):
+        animation = self._page_anim
+        if animation is None: return
+        page = animation.targetObject()
+        if animation.state() == QAbstractAnimation.Running: animation.stop()
+        if page is not None: page.move(0, 0)
+        animation.deleteLater(); self._page_anim = None
+
+    def _finish_page_animation(self, animation, page):
+        page.move(0, 0)
+        if self._page_anim is animation: self._page_anim = None
+        animation.deleteLater()
+
+    def _refresh_ledger_page(self):
+        if not hasattr(self, "_ledger_table"): return
+        account = self._account_combo.currentData() or "__all__"
+        price_map = {item["code"]: item.get("nav", 0) for item in self.last_results if item.get("status") == "ok"}
+        report = ledger_report(self._ledger_holdings_for_scope(account), price_map, load_trades(),
+                               None if account == "__all__" else account)
+        scope = "全部账户" if account == "__all__" else account
+        if not report["rows"]:
+            text, kind = f"{scope}暂无可核验的持仓或交易记录。", "tip"
+        elif report["trusted"]:
+            text, kind = f"{scope}账本完整，统一收益 {report['total']:+,.2f} 元，可核验。", "ok"
+        else:
+            text, kind = f"{scope}发现 {report['issues']} 项待处理；资料补齐前不计算统一收益。", "warn"
+        self._ledger_status.setText(text); self._ledger_status.setStyleSheet(panel_label_qss(kind))
+        self._ledger_table.setRowCount(len(report["rows"]))
+        for row, item in enumerate(report["rows"]):
+            values = [
+                f"{NAME_MAP.get(item['code'], item['code'])} ({item['code']})" +
+                (f" · {item['account']}" if account == "__all__" else ""),
+                "可信" if item["trusted"] else "待补录",
+                f"{item['shares']:.4f}", f"{item['replay_shares']:.4f}",
+                f"{item['principal']:,.2f}", f"{item['realized'] + item['cash_dividend']:+,.2f}",
+                "；".join(item["issues"]) or "—",
+            ]
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                if column == 1: cell.setForeground(QColor(T()["down"] if item["trusted"] else T()["mid_val"]))
+                self._ledger_table.setItem(row, column, cell)
+
+    def _refresh_returns_page(self):
+        if not hasattr(self, "_returns_summary"): return
+        account = self._account_combo.currentData() or "__all__"
+        price_map = {item["code"]: item.get("nav", 0) for item in self.last_results if item.get("status") == "ok"}
+        report = ledger_report(self._ledger_holdings_for_scope(account), price_map, load_trades(),
+                               None if account == "__all__" else account)
+        if report["trusted"] and report["total"] is not None:
+            self._returns_summary.setText(
+                f"统一收益  {report['total']:+,.2f} 元    未实现  {report['unrealized']:+,.2f}    "
+                f"已实现  {report['realized']:+,.2f}    现金分红  {report['cash_dividend']:+,.2f}")
+        else:
+            self._returns_summary.setText("统一收益待补录：请先到账本页处理缺失流水或持仓差异。")
+        for key, label in getattr(self, "_return_values", {}).items():
+            value = report.get(key, 0.0)
+            label.setText(f"{value:+,.2f} 元" if key != "invested" else f"{value:,.2f} 元")
+            label.setStyleSheet(f"color:{T()['up'] if value >= 0 and key != 'invested' else T()['text']};")
+
+    def _refresh_data_page(self):
+        if not hasattr(self, "_data_status"): return
+        account = self._account_combo.currentText() or "全部账户"
+        settings = load_settings() or {}
+        motion = "页面与刷新动画已关闭" if settings.get("reduce_motion", False) else "页面切换使用轻量滑入"
+        self._data_status.setText(f"当前范围：{account}    主题：{T()['name']}    {motion}")
 
     def _check_update(self):
         self._upd_worker = UpdateWorker(); self._upd_worker.found.connect(self._on_update_found); self._upd_worker.start()
@@ -3368,46 +3680,13 @@ class MainWindow(QMainWindow):
         _t0 = T()
         if _t0["win_bg"]: w.setStyleSheet(f"#homeRoot{{background:{_t0['win_bg']};}}")
         self._home_root = w
-        outer = QVBoxLayout(w); outer.setContentsMargins(18,16,18,16); outer.setSpacing(12)
+        outer = QVBoxLayout(w); outer.setContentsMargins(26,22,26,22); outer.setSpacing(12)
         top = QHBoxLayout(); top.setSpacing(8)
         t = T()
-        # v2.0.0 顶栏（FD-HIG 层级铁律）：标识+标题+徽章 ｜ 账户下拉 ｜ 幽灵导航 ｜ 图标工具 ｜ 唯一主按钮
-        self._logo_lbl = QLabel(); self._logo_lbl.setPixmap(icon_pixmap("logo", t["accent"], 26))
-        top.addWidget(self._logo_lbl)
-        self._title_lbl = QLabel("基金日报"); self._title_lbl.setFont(QFont(FONT,15,QFont.Bold)); self._title_lbl.setStyleSheet(f"color:{t['text']};")
-        top.addWidget(self._title_lbl)
-        self._ver_lbl = QLabel(f"v{APP_VERSION}"); self._ver_lbl.setFont(QFont(FONT,8))
-        self._ver_lbl.setStyleSheet(f"color:{t['muted']};border:1px solid {t['card_border']};border-radius:4px;padding:1px 5px;")
-        top.addWidget(self._ver_lbl)
-        self.lbl_time = QLabel(""); self.lbl_time.setStyleSheet(f"color:{t['muted']};"); top.addWidget(self.lbl_time)
-        top.addSpacing(8)
-        self._acc_lbl = QLabel("账户"); self._acc_lbl.setStyleSheet(f"color:{t['muted']};"); top.addWidget(self._acc_lbl)
-        self._account_combo = QComboBox(); self._account_combo.setFont(QFont(FONT,9))
-        self._account_combo.setStyleSheet(combo_qss(t))  # v2.1.0 返工：构建时即上 Win11 风样式（此前只在 _restyle_all 里，首开时原生 Win98 样）
-        self._account_combo.addItem("全部账户", "__all__")
-        for _a in load_accounts():
-            self._account_combo.addItem(_a, _a)
-        self._account_combo.currentIndexChanged.connect(self._on_account_changed)
-        top.addWidget(self._account_combo)
-        top.addSpacing(6)
-        # 导航群：统一幽灵按钮（去彩虹/去 emoji，手绘图标+文字）
-        self._tb_navs = []
-        for _k, _txt, _slot in (("hold","管理持仓",self._open_hold),("pnl","收益明细",self._open_pnl),
-                                ("trades","交易记录",lambda: TradesDialog(self).exec()),("diag","账本健康",self._show_ledger_health)):
-            _b = QPushButton(QIcon(icon_pixmap(_k, t["muted"], 15)), "  " + _txt)
-            _b.setFont(QFont(FONT,9)); _b.clicked.connect(_slot); _b.setStyleSheet(ghost_btn_qss(t))
-            self._tb_navs.append((_b, _k, _txt)); top.addWidget(_b)
-        self.btn_hold, self.btn_pnl, self.btn_trades, self.btn_diag = [x[0] for x in self._tb_navs]  # 旧属性兼容
+        page_title = QLabel("总览"); page_title.setFont(QFont(FONT,18,QFont.Bold)); page_title.setProperty("v3Heading", True)
+        top.addWidget(page_title)
+        self.lbl_time = QLabel(""); self.lbl_time.setProperty("v3Subheading", True); top.addWidget(self.lbl_time)
         top.addStretch()
-        # 工具群：纯图标小按钮归组最右（悬停显名）
-        self._tb_tools = []
-        for _k, _tip, _slot in (("export","导出",self._open_export),("backup","备份与恢复",self._open_backup),
-                                ("about","关于",self._open_about),("settings","设置",self._open_settings)):
-            _b = QPushButton(QIcon(icon_pixmap(_k, t["muted"], 15)), "")
-            _b.setFixedSize(30,30); _b.setToolTip(_tip); _b.clicked.connect(_slot)
-            _b.setStyleSheet(ghost_btn_qss(t, pad="0px")); self._tb_tools.append((_b, _k)); top.addWidget(_b)
-        self.btn_export, self.btn_backup, self.btn_about, self.btn_settings = [x[0] for x in self._tb_tools]
-        # 主操作：全顶栏唯一强调色实底按钮
         self.btn_refresh = QPushButton(QIcon(icon_pixmap("refresh", "#ffffff", 15)), "  刷新数据"); self.btn_refresh.setFont(QFont(FONT,10,QFont.Bold))
         self.btn_refresh.setStyleSheet(primary_btn_qss(t))
         self.btn_refresh.clicked.connect(self._refresh_home); top.addWidget(self.btn_refresh); outer.addLayout(top)
@@ -3516,37 +3795,78 @@ class MainWindow(QMainWindow):
             self._split.setStyleSheet(f"QSplitter::handle{{background:{T()['card_border']};}}")
 
     def _open_settings(self):
-        """v1.7：设置（主题切换）。"""
+        """v3.0：设置（主题与动态效果）。"""
         d = SettingsDialog(self)
         if d.exec() == QDialog.Accepted:
             choice = d.combo.currentData()
+            reduce_motion = d.reduce_motion.isChecked()
+            old = load_settings() or {}
             if choice and choice != _THEME:
                 set_theme(choice)
-                s = load_settings() or {}; s["theme"] = choice; save_settings(s)
                 self._restyle_all()
+            old["theme"] = choice or _THEME; old["reduce_motion"] = reduce_motion; save_settings(old)
+            self._refresh_data_page()
 
     def _apply_global_qss(self):
         """v2.0.0：弹窗/表格类控件全局主题样式（四主题全应用：classic 不再豁免，保全程序样式统一）。"""
         self.setStyleSheet(global_qss(T()))
 
     def _restyle_all(self):
-        """v1.7/v2.0.0：主题切换后全量重刷令牌化组件。"""
+        """v3.0：主题切换后全量重刷外壳、页面与既有看板组件。"""
         t = T()
         self._apply_global_qss()
+        if hasattr(self, "_shell_root"):
+            self._shell_root.setStyleSheet(f"#v3ShellRoot{{background:{t['win_bg']};}}")
+        if hasattr(self, "stack"):
+            self.stack.setStyleSheet(f"#v3PageStack{{background:{t['win_bg']};border:none;}}")
+        if hasattr(self, "_sidebar"):
+            self._sidebar.setStyleSheet(
+                f"#v3Sidebar{{background:{t['panel_bg']};border-right:1px solid {t['card_border']};}}"
+                f"#v3Sidebar QPushButton{{padding:8px 10px;border:none;border-radius:6px;background:transparent;color:{t['text_sub']};text-align:left;}}"
+                f"#v3Sidebar QPushButton:hover{{background:{t['hover_bg']};color:{t['text']};}}"
+                f"#v3Sidebar QPushButton:checked{{background:{t['accent_soft']};color:{t['accent']};font-weight:bold;}}")
+            self._logo_lbl.setPixmap(icon_pixmap("logo", t["accent"], 25))
+            self._title_lbl.setStyleSheet(f"color:{t['text']};")
+            self._ver_lbl.setStyleSheet(f"color:{t['muted']};")
+            self._account_combo.setStyleSheet(combo_qss(t))
+            for key, button in self._nav_buttons.items():
+                if isinstance(button, AnimatedNavButton):
+                    button.set_nav_color(t["accent"] if button.isChecked() else t["muted"])
+            self.btn_about.setIcon(QIcon(icon_pixmap("about", t["muted"], 16)))
+        for page in (getattr(self, "ledger_page", None), getattr(self, "returns_page", None), getattr(self, "data_page", None)):
+            if page is not None:
+                page.setStyleSheet(f"background:{t['win_bg']};")
+                for child in page.findChildren(QLabel):
+                    if child.property("v3Heading"): child.setStyleSheet(f"color:{t['text']};")
+                    elif child.property("v3Subheading"): child.setStyleSheet(f"color:{t['muted']};")
+                    elif child.property("v3GroupTitle"): child.setStyleSheet(f"color:{t['text_sub']};")
+                    elif child.property("v3SettingTitle"): child.setStyleSheet(f"color:{t['text']};")
+                    elif child.property("v3SettingIcon"):
+                        child.setPixmap(icon_pixmap(child.property("v3SettingIcon"), t["accent"], 19))
+                        child.setStyleSheet(f"background:{t['accent_soft']};border-radius:7px;")
+                    elif child.property("v3Metric"): child.setStyleSheet(
+                        f"color:{t['text']};background:{t['card_bg']};border:1px solid {t['card_border']};border-radius:6px;padding:16px;font-size:15px;")
+                for panel in page.findChildren(QFrame):
+                    if panel.property("v3Panel"):
+                        panel.setStyleSheet(board_qss())
+                    elif panel.property("v3SettingsGroup"):
+                        panel.setStyleSheet(f"QFrame{{background:{t['card_bg']};border:1px solid {t['card_border']};border-radius:8px;}}")
+                    elif panel.property("v3SettingRow"):
+                        panel.setStyleSheet("QFrame{background:transparent;border:none;}")
+                    elif panel.property("v3SettingSeparator"):
+                        panel.setStyleSheet(f"QFrame{{background:{t['card_border']};border:none;}}")
+                for table in page.findChildren(QTableWidget): table.setStyleSheet(table_qss())
+                for button in page.findChildren(QPushButton):
+                    icon = button.property("v3Icon")
+                    if icon:
+                        primary = bool(button.property("v3Primary"))
+                        button.setIcon(QIcon(icon_pixmap(icon, "#ffffff" if primary else t["muted"], 15)))
+                        button.setStyleSheet(primary_btn_qss(t) if primary else ghost_btn_qss(t))
         root = getattr(self, "_home_root", None)
         if root is not None:
             root.setStyleSheet(f"#homeRoot{{background:{t['win_bg']};}}" if t["win_bg"] else "")
-        # 顶栏（v2.0.0：图标/文字/徽章随主题重绘）
-        if hasattr(self, "_logo_lbl"):
-            self._logo_lbl.setPixmap(icon_pixmap("logo", t["accent"], 26))
-            self._title_lbl.setStyleSheet(f"color:{t['text']};")
-            self._ver_lbl.setStyleSheet(f"color:{t['muted']};border:1px solid {t['card_border']};border-radius:4px;padding:1px 5px;")
-            self.lbl_time.setStyleSheet(f"color:{t['muted']};"); self._acc_lbl.setStyleSheet(f"color:{t['muted']};")
-            self._account_combo.setStyleSheet(combo_qss(t))  # v2.1.0 返工：Win11 风（含箭头子控件），原 1.x 内联样式无子控件致首开 Win98 样
-            for b, kind, _txt in self._tb_navs:
-                b.setIcon(QIcon(icon_pixmap(kind, t["muted"], 15))); b.setStyleSheet(ghost_btn_qss(t))
-            for b, kind in self._tb_tools:
-                b.setIcon(QIcon(icon_pixmap(kind, t["muted"], 15))); b.setStyleSheet(ghost_btn_qss(t, pad="0px"))
+        if hasattr(self, "lbl_time"): self.lbl_time.setStyleSheet(f"color:{t['muted']};")
+        if hasattr(self, "btn_refresh"):
             self.btn_refresh.setIcon(QIcon(icon_pixmap("refresh", "#ffffff", 15))); self.btn_refresh.setStyleSheet(primary_btn_qss(t))
         # 提示条/快速添加/排序（v2.0.0）
         if hasattr(self, "lbl_fix"):
@@ -3612,6 +3932,10 @@ class MainWindow(QMainWindow):
                 pass
 
     def _fade_cards(self):
+        if bool((load_settings() or {}).get("reduce_motion", False)):
+            for card in self.cards.values():
+                if card.graphicsEffect() is not None: card.setGraphicsEffect(None)
+            return
         for c in self.cards.values():
             eff = QGraphicsOpacityEffect(c); c.setGraphicsEffect(eff); eff.setOpacity(0.0)
             a = QPropertyAnimation(eff, b"opacity", c); a.setDuration(260); a.setStartValue(0.0); a.setEndValue(1.0)
@@ -3660,6 +3984,7 @@ class MainWindow(QMainWindow):
         self._start_val_worker(results)  # v1.3：估值红绿灯后台拉取
         self._start_spark_worker(results)  # v2.1.0：卡片迷你走势后台拉取
         self.btn_refresh.setEnabled(True); self.btn_refresh.setText("刷新数据")
+        self._refresh_ledger_page(); self._refresh_returns_page(); self._refresh_data_page()
         if sum(1 for r in results if r.get("status")=="ok") == 0:
             QMessageBox.warning(self,"没抓到数据","全部抓取失败，请点「🩺 诊断」。")
 
@@ -3879,23 +4204,32 @@ class MainWindow(QMainWindow):
         self._sync_empty_banner(); self._restyle_all(); self._refresh_home()
 
     def _open_about(self):
-        """v1.0.0 新增：关于本软件（版本信息 / GitHub 链接 / 隐私声明 / 免责声明 / 手动检查更新）。"""
-        dlg = QDialog(self); dlg.setWindowTitle("关于本软件"); dlg.resize(460, 420)
-        lay = QVBoxLayout(dlg); lay.setSpacing(8)
-        t = QLabel("📊 基金日报"); t.setFont(QFont(FONT,18,QFont.Bold)); t.setAlignment(Qt.AlignCenter); lay.addWidget(t)
-        v = QLabel(f"v{APP_VERSION} · 正式发布"); v.setAlignment(Qt.AlignCenter); v.setStyleSheet("color:#2563eb;font-weight:bold;"); lay.addWidget(v)
+        """关于本软件：全量使用当前主题令牌与统一按钮组件。"""
+        theme = T()
+        dlg = QDialog(self); dlg.setObjectName("aboutDialog"); dlg.setWindowTitle("关于本软件"); dlg.resize(500, 430)
+        dlg.setStyleSheet(global_qss(theme))
+        lay = QVBoxLayout(dlg); lay.setContentsMargins(28,24,28,22); lay.setSpacing(12)
+        brand = QHBoxLayout(); brand.setSpacing(10); brand.addStretch()
+        logo = QLabel(); logo.setPixmap(icon_pixmap("logo", theme["accent"], 30)); brand.addWidget(logo)
+        title = QLabel("基金日报"); title.setFont(QFont(FONT,18,QFont.Bold)); title.setStyleSheet(f"color:{theme['text']};")
+        brand.addWidget(title); brand.addStretch(); lay.addLayout(brand)
+        v = QLabel(f"v{APP_VERSION} · {BUILD_CHANNEL_LABEL}"); v.setObjectName("aboutVersionLabel"); v.setAlignment(Qt.AlignCenter)
+        v.setStyleSheet(f"color:{theme['accent']};font-weight:bold;"); lay.addWidget(v)
+        lay.addSpacing(4)
         desc = QLabel("Windows 个人基金看板：实时行情 / 持仓盈亏 / 收益日历 / 多账户 / 一键备份 / 导出 Excel。\n全部持仓与交易数据仅存本地磁盘，不上传。")
-        desc.setAlignment(Qt.AlignCenter); desc.setWordWrap(True); desc.setStyleSheet("color:#555;"); lay.addWidget(desc)
-        link = QLabel(f'<a href="https://github.com/{GITHUB_REPO}">github.com/{GITHUB_REPO}</a>')
+        desc.setAlignment(Qt.AlignCenter); desc.setWordWrap(True); desc.setStyleSheet(f"color:{theme['text_sub']};"); lay.addWidget(desc)
+        link = QLabel(f'<a style="color:{theme["accent"]};" href="https://github.com/{GITHUB_REPO}">github.com/{GITHUB_REPO}</a>')
         link.setTextFormat(Qt.RichText); link.setTextInteractionFlags(Qt.TextBrowserInteraction)
         link.setOpenExternalLinks(True); link.setAlignment(Qt.AlignCenter); lay.addWidget(link)
-        b_check = QPushButton("🔄 立即检查更新")
-        b_check.setStyleSheet("QPushButton{padding:8px 14px;border-radius:8px;background:#eef3ff;color:#2563eb;border:none;}QPushButton:hover{background:#dbe6ff;}QPushButton:disabled{background:#eee;color:#999;}")
+        b_check = QPushButton("立即检查更新"); b_check.setObjectName("aboutCheckButton")
+        b_check.setIcon(QIcon(icon_pixmap("refresh", "#ffffff", 16))); b_check.setIconSize(QSize(16,16))
+        b_check.setMinimumHeight(38); b_check.setStyleSheet(primary_btn_qss(theme))
         lay.addWidget(b_check)
         def do_check():
-            b_check.setEnabled(False); b_check.setText("检查中…")
+            b_check.setEnabled(False); b_check.setText("检查中…"); b_check.setIcon(QIcon())
             def on_checked(has_new, tag, url):
-                b_check.setEnabled(True); b_check.setText("🔄 立即检查更新")
+                b_check.setEnabled(True); b_check.setText("立即检查更新")
+                b_check.setIcon(QIcon(icon_pixmap("refresh", "#ffffff", 16)))
                 if has_new:
                     QMessageBox.information(dlg, "发现新版本", f"🎉 v{tag} 已发布（当前 v{APP_VERSION}）。\n请到 GitHub Releases 下载更新。")
                 elif tag:
@@ -3907,14 +4241,20 @@ class MainWindow(QMainWindow):
             w.start()
         b_check.clicked.connect(do_check)
         disc = QLabel("免责声明：本工具仅供个人记账参考，不构成任何投资建议；\n行情数据或有延迟，以官方渠道为准。")
-        disc.setAlignment(Qt.AlignCenter); disc.setWordWrap(True); disc.setStyleSheet("color:#999;font-size:10px;"); lay.addWidget(disc)
-        b_close = QPushButton("关闭"); b_close.clicked.connect(dlg.accept)
-        b_close.setStyleSheet("QPushButton{padding:8px 24px;border-radius:8px;background:#f0f0f0;border:none;}QPushButton:hover{background:#e3e3e3;}")
+        disc.setAlignment(Qt.AlignCenter); disc.setWordWrap(True)
+        disc.setStyleSheet(f"color:{theme['muted']};font-size:10px;"); lay.addWidget(disc)
+        lay.addStretch()
+        b_close = QPushButton("关闭"); b_close.setObjectName("aboutCloseButton"); b_close.clicked.connect(dlg.accept)
+        b_close.setFixedSize(96,38); b_close.setStyleSheet(ghost_btn_qss(theme, pad="8px 24px"))
         lay.addWidget(b_close, 0, Qt.AlignCenter)
         dlg.exec()
 
     def _open_pnl(self):
         self._pnl_dialog = PnlDialog(self); self._pnl_dialog.show(); self._pnl_dialog.start()
+
+    def _open_trades(self):
+        TradesDialog(self).exec()
+        self._refresh_ledger_page(); self._refresh_returns_page()
 
     def _refresh_account_combo(self):
         """重新填充主页账户下拉框（管理账户增删改后调用，免重启，v1.1 新增）。"""
@@ -3928,6 +4268,7 @@ class MainWindow(QMainWindow):
         idx = self._account_combo.findData(cur)
         self._account_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self._account_combo.blockSignals(False)
+        self._refresh_ledger_page(); self._refresh_returns_page(); self._refresh_data_page()
 
     def _open_hold(self):
         price_map = {d["code"]: d.get("nav",0) for d in self.last_results if d.get("status")=="ok"}
@@ -3946,12 +4287,15 @@ class MainWindow(QMainWindow):
     def _on_account_changed(self):
         if self.last_results:
             self._apply_results()
+        self._refresh_ledger_page(); self._refresh_returns_page(); self._refresh_data_page()
 
     def _open_detail(self, code):
         # v2.2.0：把当日涨跌幅传给详情页副行（今日盈亏）
         _chg = next((d.get("chg") for d in self.last_results if d.get("code") == code and d.get("status") == "ok"), None)
-        self.detail.load(code, self.resolved.get(code, {}), (self._val_cache.get("pct") or {}).get(code), _chg); self.stack.setCurrentIndex(1)
-    def _go_home(self): self.stack.setCurrentIndex(0)
+        self.detail.load(code, self.resolved.get(code, {}), (self._val_cache.get("pct") or {}).get(code), _chg)
+        self.stack.setCurrentWidget(self.detail)
+        for button in self._nav_buttons.values(): button.setChecked(False)
+    def _go_home(self): self._switch_page("overview")
 
     def _redraw_aggregates(self):
         self.chart.draw([(d.get("name",d["code"])[:8], d.get("chg",0)) for d in self.last_results], animate=False)
